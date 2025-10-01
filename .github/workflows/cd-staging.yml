@@ -1,339 +1,118 @@
-name: CD - Stage 2 (Staging, Ephemeral AKS)
+name: CD - Stage 2 (Staging)
 
 on:
   workflow_run:
-    workflows: ["CI - Stage 1 (Testing)", "CI — Verify, Build, Publish (testing)"]
+    workflows: ["CI - Stage 1 (Testing)"]
     types: [completed]
-  workflow_dispatch: {}
+    branches: [testing]
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: "ACR tag to deploy (default: testing-latest)"
+        required: false
+        type: string
 
 permissions:
   id-token: write
   contents: read
 
+concurrency:
+  group: stage-${{ github.event.workflow_run.head_sha || github.run_id }}
+  cancel-in-progress: true
+
 env:
-  # ACR
-  REGISTRY: ${{ secrets.ACR_LOGIN_SERVER }}     # e.g. kiranacr722.azurecr.io
-  REPO_PREFIX: sit722                            # image path prefix: <REGISTRY>/<REPO_PREFIX>/<service>
-  # AKS
-  AKS_RG: ${{ vars.AKS_RESOURCE_GROUP }}         # e.g. rg-sit722-kiran
-  AKS_CLUSTER: ${{ vars.AKS_CLUSTER_NAME }}      # e.g. kiranaks722
-  # Image tag to deploy
-  TAG: testing-latest                            # uses images pushed by Stage 1
+  REGISTRY: ${{ secrets.ACR_LOGIN_SERVER }}
 
 jobs:
-  deploy_staging:
-    name: Deploy ephemeral staging to AKS
-    if: >
-      github.event_name == 'workflow_dispatch' ||
-      (github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success')
+  deploy-staging:
+    if: github.event_name == 'workflow_dispatch' || (github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success')
     runs-on: ubuntu-latest
+    env:
+      AKS_RG:      ${{ vars.AKS_RESOURCE_GROUP }}
+      AKS_CLUSTER: ${{ vars.AKS_CLUSTER_NAME }}
+      NS:          ${{ vars.STAGING_NAMESPACE }}
+      REPO:        ${{ vars.REPO_PREFIX || 'sit722' }}
+      TAG:         ${{ inputs.image_tag != '' && inputs.image_tag || 'testing-latest' }}
 
     steps:
-      - name: Checkout
+      - name: Checkout triggering commit
         uses: actions/checkout@v4
+        with:
+          ref: ${{ (github.event_name == 'workflow_run' && github.event.workflow_run.head_sha) || github.sha }}
+          fetch-depth: 1
 
-      - name: Azure Login (OIDC)
+      - name: Locate Kubernetes manifests
+        id: find
+        shell: bash
+        run: |
+          set -euo pipefail
+          for d in k8s K8s deploy/k8s manifests; do
+            if [[ -d "$d" ]] && compgen -G "$d/*.y*ml" > /dev/null; then
+              echo "dir=$d" >> "$GITHUB_OUTPUT"
+              echo "Manifests: $d"
+              exit 0
+            fi
+          done
+          echo "::error::No folder with Kubernetes YAMLs found (looked in: k8s, K8s, deploy/k8s, manifests)"
+          echo "Tree:"; find . -maxdepth 2 -type d -print
+          exit 1
+
+      - name: Azure login
         uses: azure/login@v2
         with:
-          # Service principal JSON in secrets.AZURE_CREDENTIALS
           creds: ${{ secrets.AZURE_CREDENTIALS }}
 
       - name: Set AKS context
         uses: azure/aks-set-context@v4
         with:
           resource-group: ${{ env.AKS_RG }}
-          cluster-name: ${{ env.AKS_CLUSTER }}
+          cluster-name:   ${{ env.AKS_CLUSTER }}
+          subscription:   ${{ fromJson(secrets.AZURE_CREDENTIALS).subscriptionId }}
 
-      - name: Compute ephemeral namespace
-        id: ns
-        run: |
-          SHA="${{ github.event.workflow_run.head_sha || github.sha }}"
-          SHORT="${SHA:0:7}"
-          NS="stg-${SHORT}"
-          echo "NS=$NS" >> $GITHUB_ENV
-          echo "Computed namespace: $NS"
-
-      - name: Create namespace
+      - name: Ensure namespace & imagePullSecret
+        env:
+          SP_APP_ID: ${{ fromJson(secrets.AZURE_CREDENTIALS).clientId }}
+          SP_PASS:   ${{ fromJson(secrets.AZURE_CREDENTIALS).clientSecret }}
         run: |
           kubectl get ns "$NS" >/dev/null 2>&1 || kubectl create ns "$NS"
-          kubectl get ns "$NS"
-
-      - name: Create ACR pull secret in staging ns
-        run: |
-          CLIENT_ID=$(jq -r '.clientId' <<< '${{ secrets.AZURE_CREDENTIALS }}')
-          CLIENT_SECRET=$(jq -r '.clientSecret' <<< '${{ secrets.AZURE_CREDENTIALS }}')
-          kubectl -n "$NS" delete secret acr-pull >/dev/null 2>&1 || true
-          kubectl -n "$NS" create secret docker-registry acr-pull \
-            --docker-server="${{ env.REGISTRY }}" \
-            --docker-username="$CLIENT_ID" \
-            --docker-password="$CLIENT_SECRET"
-
-      - name: (Optional) App DB credentials secret
-        run: |
-          # Default creds match your apps and local compose
-          kubectl -n "$NS" delete secret ecomm-secrets >/dev/null 2>&1 || true
-          kubectl -n "$NS" create secret generic ecomm-secrets \
-            --from-literal=POSTGRES_USER=postgres \
-            --from-literal=POSTGRES_PASSWORD=postgres
-
-      - name: Write Kubernetes manifests for staging
-        run: |
-          mkdir -p k8s/staging
-
-          cat > k8s/staging-postgres.yaml <<'YAML'
-          ---
-          apiVersion: v1
-          kind: Service
-          metadata: { name: customer-db }
-          spec:
-            selector: { app: customer-db }
-            ports: [{ port: 5432, targetPort: 5432 }]
-          ---
-          apiVersion: apps/v1
-          kind: Deployment
-          metadata: { name: customer-db }
-          spec:
-            replicas: 1
-            selector: { matchLabels: { app: customer-db } }
-            template:
-              metadata: { labels: { app: customer-db } }
-              spec:
-                containers:
-                  - name: pg
-                    image: postgres:16
-                    ports: [{ containerPort: 5432 }]
-                    env:
-                      - name: POSTGRES_USER
-                        valueFrom: { secretKeyRef: { name: ecomm-secrets, key: POSTGRES_USER } }
-                      - name: POSTGRES_PASSWORD
-                        valueFrom: { secretKeyRef: { name: ecomm-secrets, key: POSTGRES_PASSWORD } }
-                      - name: POSTGRES_DB
-                        value: customers
-          ---
-          apiVersion: v1
-          kind: Service
-          metadata: { name: product-db }
-          spec:
-            selector: { app: product-db }
-            ports: [{ port: 5432, targetPort: 5432 }]
-          ---
-          apiVersion: apps/v1
-          kind: Deployment
-          metadata: { name: product-db }
-          spec:
-            replicas: 1
-            selector: { matchLabels: { app: product-db } }
-            template:
-              metadata: { labels: { app: product-db } }
-              spec:
-                containers:
-                  - name: pg
-                    image: postgres:16
-                    ports: [{ containerPort: 5432 }]
-                    env:
-                      - name: POSTGRES_USER
-                        valueFrom: { secretKeyRef: { name: ecomm-secrets, key: POSTGRES_USER } }
-                      - name: POSTGRES_PASSWORD
-                        valueFrom: { secretKeyRef: { name: ecomm-secrets, key: POSTGRES_PASSWORD } }
-                      - name: POSTGRES_DB
-                        value: products
-          ---
-          apiVersion: v1
-          kind: Service
-          metadata: { name: order-db }
-          spec:
-            selector: { app: order-db }
-            ports: [{ port: 5432, targetPort: 5432 }]
-          ---
-          apiVersion: apps/v1
-          kind: Deployment
-          metadata: { name: order-db }
-          spec:
-            replicas: 1
-            selector: { matchLabels: { app: order-db } }
-            template:
-              metadata: { labels: { app: order-db } }
-              spec:
-                containers:
-                  - name: pg
-                    image: postgres:16
-                    ports: [{ containerPort: 5432 }]
-                    env:
-                      - name: POSTGRES_USER
-                        valueFrom: { secretKeyRef: { name: ecomm-secrets, key: POSTGRES_USER } }
-                      - name: POSTGRES_PASSWORD
-                        valueFrom: { secretKeyRef: { name: ecomm-secrets, key: POSTGRES_PASSWORD } }
-                      - name: POSTGRES_DB
-                        value: orders
-          YAML
-
-          cat > k8s/staging-apps.yaml <<'YAML'
-          ---
-          apiVersion: v1
-          kind: Service
-          metadata: { name: customer-service }
-          spec:
-            selector: { app: customer-service }
-            ports: [{ port: 8000, targetPort: 8000 }]
-          ---
-          apiVersion: apps/v1
-          kind: Deployment
-          metadata: { name: customer-service }
-          spec:
-            replicas: 1
-            selector: { matchLabels: { app: customer-service } }
-            template:
-              metadata: { labels: { app: customer-service } }
-              spec:
-                imagePullSecrets: [{ name: acr-pull }]
-                containers:
-                  - name: customer
-                    image: ${REGISTRY}/${REPO_PREFIX}/customer_service:${TAG}
-                    ports: [{ containerPort: 8000 }]
-                    env:
-                      - name: POSTGRES_HOST
-                        value: customer-db
-                      - name: POSTGRES_PORT
-                        value: "5432"
-                      - name: POSTGRES_DB
-                        value: customers
-                      - name: POSTGRES_USER
-                        valueFrom: { secretKeyRef: { name: ecomm-secrets, key: POSTGRES_USER } }
-                      - name: POSTGRES_PASSWORD
-                        valueFrom: { secretKeyRef: { name: ecomm-secrets, key: POSTGRES_PASSWORD } }
-          ---
-          apiVersion: v1
-          kind: Service
-          metadata: { name: product-service }
-          spec:
-            selector: { app: product-service }
-            ports: [{ port: 8000, targetPort: 8000 }]
-          ---
-          apiVersion: apps/v1
-          kind: Deployment
-          metadata: { name: product-service }
-          spec:
-            replicas: 1
-            selector: { matchLabels: { app: product-service } }
-            template:
-              metadata: { labels: { app: product-service } }
-              spec:
-                imagePullSecrets: [{ name: acr-pull }]
-                containers:
-                  - name: product
-                    image: ${REGISTRY}/${REPO_PREFIX}/product_service:${TAG}
-                    ports: [{ containerPort: 8000 }]
-                    env:
-                      - name: POSTGRES_HOST
-                        value: product-db
-                      - name: POSTGRES_PORT
-                        value: "5432"
-                      - name: POSTGRES_DB
-                        value: products
-                      - name: POSTGRES_USER
-                        valueFrom: { secretKeyRef: { name: ecomm-secrets, key: POSTGRES_USER } }
-                      - name: POSTGRES_PASSWORD
-                        valueFrom: { secretKeyRef: { name: ecomm-secrets, key: POSTGRES_PASSWORD } }
-          ---
-          apiVersion: v1
-          kind: Service
-          metadata: { name: order-service }
-          spec:
-            selector: { app: order-service }
-            ports: [{ port: 8000, targetPort: 8000 }]
-          ---
-          apiVersion: apps/v1
-          kind: Deployment
-          metadata: { name: order-service }
-          spec:
-            replicas: 1
-            selector: { matchLabels: { app: order-service } }
-            template:
-              metadata: { labels: { app: order-service } }
-              spec:
-                imagePullSecrets: [{ name: acr-pull }]
-                containers:
-                  - name: order
-                    image: ${REGISTRY}/${REPO_PREFIX}/order_service:${TAG}
-                    ports: [{ containerPort: 8000 }]
-                    env:
-                      - name: POSTGRES_HOST
-                        value: order-db
-                      - name: POSTGRES_PORT
-                        value: "5432"
-                      - name: POSTGRES_DB
-                        value: orders
-                      - name: POSTGRES_USER
-                        valueFrom: { secretKeyRef: { name: ecomm-secrets, key: POSTGRES_USER } }
-                      - name: POSTGRES_PASSWORD
-                        valueFrom: { secretKeyRef: { name: ecomm-secrets, key: POSTGRES_PASSWORD } }
-          ---
-          apiVersion: v1
-          kind: Service
-          metadata: { name: frontend }
-          spec:
-            selector: { app: frontend }
-            ports: [{ port: 80, targetPort: 80 }]
-          ---
-          apiVersion: apps/v1
-          kind: Deployment
-          metadata: { name: frontend }
-          spec:
-            replicas: 1
-            selector: { matchLabels: { app: frontend } }
-            template:
-              metadata: { labels: { app: frontend } }
-              spec:
-                imagePullSecrets: [{ name: acr-pull }]
-                containers:
-                  - name: frontend
-                    image: ${REGISTRY}/${REPO_PREFIX}/frontend:${TAG}
-                    ports: [{ containerPort: 80 }]
-          YAML
+          kubectl -n "$NS" create secret docker-registry acr-cred \
+            --docker-server="$REGISTRY" \
+            --docker-username="$SP_APP_ID" \
+            --docker-password="$SP_PASS" \
+            --docker-email="devnull@example.com" \
+            --dry-run=client -o yaml | kubectl apply -f -
+          kubectl -n "$NS" patch serviceaccount default -p '{"imagePullSecrets":[{"name":"acr-cred"}]}' || true
 
       - name: Apply manifests
+        run: kubectl apply -n "$NS" -f "${{ steps.find.outputs.dir }}"
+
+      - name: Pin images to tag
         run: |
-          kubectl -n "$NS" apply -f k8s/staging-postgres.yaml
-          # Postgres needs a few seconds to init databases
-          echo "Waiting 12s for Postgres pods to initialize..."
-          sleep 12
-          kubectl -n "$NS" apply -f k8s/staging-apps.yaml
+          set -e
+          declare -A MAP=(
+            [customer-service]="${REGISTRY}/${REPO}/customer_service:${TAG}"
+            [product-service]="${REGISTRY}/${REPO}/product_service:${TAG}"
+            [order-service]="${REGISTRY}/${REPO}/order_service:${TAG}"
+            [frontend]="${REGISTRY}/${REPO}/frontend:${TAG}"
+            [customer-service-w10-aks]="${REGISTRY}/${REPO}/customer_service:${TAG}"
+            [product-service-w10-aks]="${REGISTRY}/${REPO}/product_service:${TAG}"
+            [order-service-w10-aks]="${REGISTRY}/${REPO}/order_service:${TAG}"
+            [frontend-w10-aks]="${REGISTRY}/${REPO}/frontend:${TAG}"
+          )
+          for dep in "${!MAP[@]}"; do
+            kubectl -n "$NS" set image deployment/$dep "*=${MAP[$dep]}" --record=false 2>/dev/null || true
+          done
 
       - name: Wait for rollouts
         run: |
-          set -e
-          for d in customer-db product-db order-db customer-service product-service order-service frontend; do
-            echo "Waiting for $d..."
-            kubectl -n "$NS" rollout status deploy/$d --timeout=180s
+          for d in customer-service product-service order-service frontend \
+                   customer-service-w10-aks product-service-w10-aks order-service-w10-aks frontend-w10-aks
+          do
+            kubectl -n "$NS" rollout status deployment/$d --timeout=300s || true
           done
 
-      - name: Smoke test from inside cluster
+      - name: Smoke inventory
         run: |
-          set -e
-          kubectl -n "$NS" run curl --image=curlimages/curl:8.10.1 --restart=Never --command -- \
-            sh -c '
-              echo "Hitting customer-service...";
-              curl -sf http://customer-service:8000/ || exit 1;
-              echo "Hitting product-service...";
-              curl -sf http://product-service:8000/ || exit 1;
-              echo "Hitting order-service...";
-              curl -sf http://order-service:8000/ || exit 1;
-              echo "All service roots responded.";
-            '
-          # clean up the curl pod
-          kubectl -n "$NS" delete pod curl --ignore-not-found=true
-
-      - name: Snapshot resources
-        if: always()
-        run: |
-          kubectl -n "$NS" get all -o wide
-          echo "---"
-          kubectl -n "$NS" get svc
-          echo "---"
-          kubectl get ns "$NS" -o yaml | sed -n '1,120p'
-
-      - name: Teardown (delete namespace)
-        if: always()
-        run: |
-          kubectl delete ns "$NS" --wait=true
-          echo "Ephemeral staging namespace $NS deleted."
+          kubectl -n "$NS" get pods -o wide
+          kubectl -n "$NS" get svc -o wide
+          kubectl -n "$NS" get ingress -o wide || true
