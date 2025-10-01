@@ -1,9 +1,10 @@
 name: CD - Stage 2 (Staging)
 
 on:
+  # Run automatically after *any* workflow completes; we'll gate it to your CI run below.
   workflow_run:
-    workflows: ["CI - Stage 1 (Testing)"]
-    types: [completed]               # no branches filter here (works for push/PR)
+    types: [completed]
+  # Allow manual runs from the Actions tab too
   workflow_dispatch:
     inputs:
       image_tag:
@@ -26,12 +27,15 @@ concurrency:
 jobs:
   deploy-staging:
     name: Deploy Staging
-    # run when: manual OR CI succeeded AND CI's source branch was 'testing'
+    # Run when: manual OR the CI workflow finished SUCCESSFULLY
+    # AND the CI's SOURCE BRANCH was 'testing'
+    # AND the workflow that completed was EXACTLY your CI ("CI - Stage 1 (Testing)")
     if: |
       github.event_name == 'workflow_dispatch' ||
       (github.event_name == 'workflow_run' &&
        github.event.workflow_run.conclusion == 'success' &&
-       github.event.workflow_run.head_branch == 'testing')
+       github.event.workflow_run.head_branch == 'testing' &&
+       github.event.workflow_run.name == 'CI - Stage 1 (Testing)')
     runs-on: ubuntu-latest
     permissions:
       id-token: write
@@ -40,13 +44,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # (optional) debug the incoming workflow_run payload
+      # Debug what's coming from workflow_run (handy if it still doesn't trigger once)
       - name: Debug workflow_run
         if: github.event_name == 'workflow_run'
         run: |
           echo "head_branch=${{ github.event.workflow_run.head_branch }}"
-          echo "event=${{ github.event.workflow_run.event }}"
+          echo "name=${{ github.event.workflow_run.name }}"
           echo "conclusion=${{ github.event.workflow_run.conclusion }}"
+          echo "event=${{ github.event.workflow_run.event }}"
 
       - name: Compute Image Tag and Namespace
         id: meta
@@ -88,7 +93,7 @@ jobs:
           NS="${{ steps.meta.outputs.NS }}"
           kubectl get ns "$NS" >/dev/null 2>&1 || kubectl create ns "$NS"
 
-      # Optional: only needed if AKS is NOT attached to ACR
+      # Optional: only needed if AKS is NOT attached to ACR; harmless if it is.
       - name: Create ACR imagePullSecret in Namespace
         env:
           REG: ${{ steps.meta.outputs.REG }}
@@ -141,6 +146,7 @@ jobs:
         run: |
           set -e
           NS="${{ steps.meta.outputs.NS }}"
+          # If your health endpoint isn't /health, change paths below accordingly
           kubectl -n "$NS" port-forward svc/product-service 18000:8000 >/dev/null 2>&1 &
           P1=$!
           kubectl -n "$NS" port-forward svc/order-service   18001:8000 >/dev/null 2>&1 &
