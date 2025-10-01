@@ -3,9 +3,9 @@ name: CD - Stage 2 (Staging)
 on:
   workflow_run:
     workflows: ["CI - Stage 1 (Testing + Build + Push)", ".github/workflows/ci-testing.yml"]
-    branches: [testing]
+    branches: [testing]     # only react to CI runs on 'testing'
     types: [completed]
-  workflow_dispatch: {}
+  workflow_dispatch: {}     # optional manual trigger
 
 concurrency:
   group: staging-${{ github.event.workflow_run.head_sha || github.sha }}
@@ -16,15 +16,17 @@ permissions:
   contents: read
 
 env:
-  AKS_RG: ${{ vars.AKS_RESOURCE_GROUP }}       # rg-sit722-kiran
-  AKS_CLUSTER: ${{ vars.AKS_CLUSTER_NAME }}    # kiranaks722
+  # AKS / ACR config (set these in repo Settings → Secrets/Variables)
+  AKS_RG: ${{ vars.AKS_RESOURCE_GROUP }}       # e.g. rg-sit722-kiran
+  AKS_CLUSTER: ${{ vars.AKS_CLUSTER_NAME }}    # e.g. kiranaks722
   STAGE_NS: staging-sit722-kiran
-  REGISTRY: ${{ secrets.ACR_LOGIN_SERVER }}    # kiranacr722.azurecr.io
+  REGISTRY: ${{ secrets.ACR_LOGIN_SERVER }}    # e.g. kiranacr722.azurecr.io
   REPO_PREFIX: sit722
   TAG: testing-latest
 
 jobs:
   deploy:
+    # Run only when CI on 'testing' succeeded (or manual run)
     if: >
       (github.event_name == 'workflow_run' &&
        github.event.workflow_run.conclusion == 'success' &&
@@ -61,8 +63,11 @@ jobs:
           CLIENT_SECRET=$(jq -r '.clientSecret' <<< '${{ secrets.AZURE_CREDENTIALS }}')
           kubectl -n "${STAGE_NS}" delete secret acr-cred >/dev/null 2>&1 || true
           kubectl -n "${STAGE_NS}" create secret docker-registry acr-cred \
-            --docker-server="${REGISTRY}" --docker-username="${CLIENT_ID}" --docker-password="${CLIENT_SECRET}"
-          kubectl -n "${STAGE_NS}" patch serviceaccount default -p '{"imagePullSecrets":[{"name":"acr-cred"}]}' || true
+            --docker-server="${REGISTRY}" \
+            --docker-username="${CLIENT_ID}" \
+            --docker-password="${CLIENT_SECRET}"
+          kubectl -n "${STAGE_NS}" patch serviceaccount default \
+            -p '{"imagePullSecrets":[{"name":"acr-cred"}]}' || true
 
       - name: Ensure DB secret (ecomm-secrets)
         run: |
@@ -92,6 +97,7 @@ jobs:
         run: |
           set -e
           kubectl -n "${STAGE_NS}" run curl --image=curlimages/curl:8.10.1 --restart=Never --command -- sleep 3600
+          kubectl -n "${STAGE_NS}" wait --for=condition=Ready pod/curl --timeout=60s
           for svc in customer-service product-service order-service; do
             echo "Waiting for $svc to respond on :8000 ..."
             i=0
