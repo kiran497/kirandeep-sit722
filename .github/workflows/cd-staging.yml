@@ -3,8 +3,7 @@ name: CD - Stage 2 (Staging)
 on:
   workflow_run:
     workflows: ["CI - Stage 1 (Testing)"]
-    types: [completed]
-    branches: [testing]
+    types: [completed]               # no branches filter here (works for push/PR)
   workflow_dispatch:
     inputs:
       image_tag:
@@ -17,7 +16,7 @@ on:
         type: string
 
 env:
-  REGISTRY:     ${{ secrets.ACR_LOGIN_SERVER }}         # e.g. kiranacr722aue.azurecr.io
+  REGISTRY:     ${{ secrets.ACR_LOGIN_SERVER }}         # e.g. kiranacrXXXX.azurecr.io
   REPO_PREFIX:  ${{ vars.REPO_PREFIX || 'sit722' }}     # you set 'sit722'
 
 concurrency:
@@ -27,7 +26,12 @@ concurrency:
 jobs:
   deploy-staging:
     name: Deploy Staging
-    if: github.event_name == 'workflow_dispatch' || (github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success')
+    # run when: manual OR CI succeeded AND CI's source branch was 'testing'
+    if: |
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'workflow_run' &&
+       github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.head_branch == 'testing')
     runs-on: ubuntu-latest
     permissions:
       id-token: write
@@ -35,6 +39,14 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+
+      # (optional) debug the incoming workflow_run payload
+      - name: Debug workflow_run
+        if: github.event_name == 'workflow_run'
+        run: |
+          echo "head_branch=${{ github.event.workflow_run.head_branch }}"
+          echo "event=${{ github.event.workflow_run.event }}"
+          echo "conclusion=${{ github.event.workflow_run.conclusion }}"
 
       - name: Compute Image Tag and Namespace
         id: meta
@@ -76,7 +88,7 @@ jobs:
           NS="${{ steps.meta.outputs.NS }}"
           kubectl get ns "$NS" >/dev/null 2>&1 || kubectl create ns "$NS"
 
-      # Optional: only needed if AKS is NOT attached to ACR.
+      # Optional: only needed if AKS is NOT attached to ACR
       - name: Create ACR imagePullSecret in Namespace
         env:
           REG: ${{ steps.meta.outputs.REG }}
