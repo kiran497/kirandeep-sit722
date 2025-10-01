@@ -3,10 +3,11 @@ name: CD - Stage 2 (Staging)
 on:
   workflow_run:
     workflows: ["CI - Stage 1 (Testing + Build + Push)", ".github/workflows/ci-testing.yml"]
-    branches: [testing]
+    branches: [testing]         
     types: [completed]
-  workflow_dispatch: {}
+  workflow_dispatch: {}          
 
+# prevent overlapping staging deploys from multiple pushes
 concurrency:
   group: staging-${{ github.event.workflow_run.head_sha || github.sha }}
   cancel-in-progress: true
@@ -16,29 +17,34 @@ permissions:
   contents: read
 
 env:
-  AKS_RG: ${{ vars.AKS_RESOURCE_GROUP }}
-  AKS_CLUSTER: ${{ vars.AKS_CLUSTER_NAME }}
+  AKS_RG: ${{ vars.AKS_RESOURCE_GROUP }}       # rg-sit722-kiran
+  AKS_CLUSTER: ${{ vars.AKS_CLUSTER_NAME }}    # kiranaks722
   STAGE_NS: staging-sit722-kiran
-  REGISTRY: ${{ secrets.ACR_LOGIN_SERVER }}
+  REGISTRY: ${{ secrets.ACR_LOGIN_SERVER }}    # kiranacr722.azurecr.io
   REPO_PREFIX: sit722
   TAG: testing-latest
 
 jobs:
   deploy:
+    # run ONLY when CI on 'testing' succeeded (or manual run)
     if: >
       (github.event_name == 'workflow_run' &&
        github.event.workflow_run.conclusion == 'success' &&
        github.event.workflow_run.head_branch == 'testing')
       || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout testing branch (k8s lives here)
         uses: actions/checkout@v4
-        with: { ref: testing, fetch-depth: 1 }
+        with:
+          ref: testing
+          fetch-depth: 1
 
       - name: Azure Login
         uses: azure/login@v2
-        with: { creds: ${{ secrets.AZURE_CREDENTIALS }} }
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
 
       - name: Set AKS context
         uses: azure/aks-set-context@v4
@@ -53,22 +59,27 @@ jobs:
 
       - name: Create/Update ACR imagePullSecret (acr-cred)
         run: |
-          CLIENT_ID=$(jq -r '.clientId' <<< '${{ secrets.AZURE_CREDENTIALS }}')
+          CLIENT_ID=$(jq -r '.clientId'    <<< '${{ secrets.AZURE_CREDENTIALS }}')
           CLIENT_SECRET=$(jq -r '.clientSecret' <<< '${{ secrets.AZURE_CREDENTIALS }}')
           kubectl -n "${STAGE_NS}" delete secret acr-cred >/dev/null 2>&1 || true
           kubectl -n "${STAGE_NS}" create secret docker-registry acr-cred \
-            --docker-server="${REGISTRY}" --docker-username="${CLIENT_ID}" --docker-password="${CLIENT_SECRET}"
-          kubectl -n "${STAGE_NS}" patch serviceaccount default -p '{"imagePullSecrets":[{"name":"acr-cred"}]}' || true
+            --docker-server="${REGISTRY}" \
+            --docker-username="${CLIENT_ID}" \
+            --docker-password="${CLIENT_SECRET}"
+          kubectl -n "${STAGE_NS}" patch serviceaccount default \
+            -p '{"imagePullSecrets":[{"name":"acr-cred"}]}' || true
 
       - name: Ensure DB secret (ecomm-secrets)
         run: |
           kubectl -n "${STAGE_NS}" delete secret ecomm-secrets >/dev/null 2>&1 || true
           kubectl -n "${STAGE_NS}" create secret generic ecomm-secrets \
-            --from-literal=POSTGRES_USER=postgres --from-literal=POSTGRES_PASSWORD=postgres
+            --from-literal=POSTGRES_USER=postgres \
+            --from-literal=POSTGRES_PASSWORD=postgres
 
-      # --- DBs first ---
+      # ---------- DBs first ----------
       - name: Apply DB manifests first
         run: |
+          ls -la k8s
           kubectl -n "${STAGE_NS}" apply -f k8s/customer-db.yaml
           kubectl -n "${STAGE_NS}" apply -f k8s/product-db.yaml
           kubectl -n "${STAGE_NS}" apply -f k8s/order-db.yaml
@@ -81,7 +92,7 @@ jobs:
             kubectl -n "${STAGE_NS}" rollout status deploy/$d --timeout=240s
           done
 
-      # --- Apps (single rollout; images defined in YAML) ---
+      # ---------- Apps (single rollout; images come from YAML) ----------
       - name: Apply app manifests
         run: |
           kubectl -n "${STAGE_NS}" apply -f k8s/customer-service.yaml
@@ -112,8 +123,15 @@ jobs:
       - name: Debug on failure
         if: failure()
         run: |
+          echo "=== Pods ==="
           kubectl -n "${STAGE_NS}" get pods -o wide
           for d in customer-service product-service order-service; do
             echo "==== DESCRIBE $d ===="; kubectl -n "${STAGE_NS}" describe deploy/$d | sed -n '1,200p' || true
             echo "==== LOGS $d ====";     kubectl -n "${STAGE_NS}" logs deploy/$d --tail=200 || true
           done
+
+      - name: Snapshot (always)
+        if: always()
+        run: |
+          kubectl -n "${STAGE_NS}" get all -o wide
+          kubectl -n "${STAGE_NS}" get svc
