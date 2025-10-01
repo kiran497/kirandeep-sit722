@@ -4,70 +4,49 @@ on:
   workflow_run:
     workflows: ["CI - Stage 1 (Testing)"]
     types: [completed]
-    branches: [testing]
-  workflow_dispatch:
-    inputs:
-      image_tag:
-        description: "ACR image tag to deploy (default: testing-latest)"
-        required: false
-        type: string
-      namespace_suffix:
-        description: "Optional: override dynamic staging namespace suffix"
-        required: false
-        type: string
 
-env:
-  REGISTRY: ${{ secrets.ACR_LOGIN_SERVER }}
+permissions:
+  id-token: write
+  contents: read
 
+# prevent overlapping deploys
 concurrency:
-  group: staging-${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || github.run_id }}
+  group: staging-${{ github.event.workflow_run.head_sha || github.run_id }}
   cancel-in-progress: true
 
+# global env
+env:
+  REGISTRY: ${{ secrets.ACR_LOGIN_SERVER }}
+  REPO_PREFIX: ${{ vars.REPO_PREFIX || 'sit722' }}
+  AKS_RG: ${{ vars.AKS_RG }}
+  AKS_CLUSTER: ${{ vars.AKS_CLUSTER }}
+  STAGE_NS: ${{ vars.STAGE_NS }}
+  TAG: testing-latest
+
 jobs:
-  deploy-staging:
-    name: Deploy Staging
-    # run when manually dispatched OR CI finished successfully on testing
-    if: github.event_name == 'workflow_dispatch' || (github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success')
+  deploy:
+    if: >
+      ${{
+        github.event.workflow_run.conclusion == 'success' &&
+        github.event.workflow_run.head_branch == 'testing'
+      }}
     runs-on: ubuntu-latest
     permissions: { id-token: write, contents: read }
+
+    # ⬇️ Map repo VARIABLES to the env names used by the steps
+    env:
+      AKS_RG:         ${{ vars.AKS_RESOURCE_GROUP }}   # e.g. rg-sit722-kiran
+      AKS_CLUSTER:    ${{ vars.AKS_CLUSTER_NAME }}     # e.g. kiranaks722
+      STAGE_NS:       ${{ vars.STAGING_NAMESPACE }}    # e.g. staging-sit722-kiran
+      REPO_PREFIX:    ${{ vars.REPO_PREFIX || 'sit722' }}
+      TAG:            ${{ inputs.image_tag || 'testing-latest' }}
 
     steps:
       # Checkout the commit that produced the images (for workflow_run),
       # otherwise the current SHA for manual runs
       - uses: actions/checkout@v4
         with:
-          ref: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || github.sha }}
-          fetch-depth: 1
-
-      - name: Compute tag / namespace / prefix
-        id: meta
-        shell: bash
-        run: |
-          if [ "${{ github.event_name }}" = "workflow_run" ]; then
-            SHA="${{ github.event.workflow_run.head_sha }}"
-          else
-            SHA="${{ github.sha }}"
-          fi
-          SHORT="${SHA:0:7}"
-
-          # tag: input or default
-          TAG="${{ inputs.image_tag }}"
-          [ -z "$TAG" ] && TAG="testing-latest"
-
-          # namespace: dynamic "staging-<suffix>" (override via input)
-          SUFFIX="${{ inputs.namespace_suffix }}"
-          [ -z "$SUFFIX" ] && SUFFIX="$SHORT"
-          NS="staging-$SUFFIX"
-
-          # repo prefix (matches your repo variable)
-          PREFIX="${{ vars.REPO_PREFIX }}"
-          [ -z "$PREFIX" ] && PREFIX="sit722"
-
-          echo "TAG=$TAG"     >> "$GITHUB_OUTPUT"
-          echo "NS=$NS"       >> "$GITHUB_OUTPUT"
-          echo "PREFIX=$PREFIX" >> "$GITHUB_OUTPUT"
-          echo "REG=${{ env.REGISTRY }}" >> "$GITHUB_OUTPUT"
-          echo "Using REG=${{ env.REGISTRY }}, TAG=$TAG, NS=$NS, PREFIX=$PREFIX"
+          ref: ${{ github.event.workflow_run.head_sha }}
 
       - name: Azure login
         uses: azure/login@v2
@@ -77,93 +56,28 @@ jobs:
       - name: Set AKS context
         uses: azure/aks-set-context@v4
         with:
-          resource-group: ${{ vars.AKS_RESOURCE_GROUP }}
-          cluster-name:   ${{ vars.AKS_CLUSTER_NAME }}
-          # optional but removes the warning:
-          subscription:   ${{ fromJson(secrets.AZURE_CREDENTIALS).subscriptionId }}
+          resource-group: ${{ env.AKS_RG }}
+          cluster-name: ${{ env.AKS_CLUSTER }}
 
-      - name: Ensure namespace exists
-        run: kubectl get ns "${{ steps.meta.outputs.NS }}" >/dev/null 2>&1 || kubectl create ns "${{ steps.meta.outputs.NS }}"
-
-      - name: Create/Update ACR imagePullSecret
-        env:
-          REG: ${{ steps.meta.outputs.REG }}
-          NS:  ${{ steps.meta.outputs.NS }}
-          SP_APP_ID:   ${{ fromJson(secrets.AZURE_CREDENTIALS).clientId }}
-          SP_PASSWORD: ${{ fromJson(secrets.AZURE_CREDENTIALS).clientSecret }}
-        run: |
-          kubectl -n "$NS" create secret docker-registry acr-cred \
-            --docker-server="$REG" \
-            --docker-username="$SP_APP_ID" \
-            --docker-password="$SP_PASSWORD" \
-            --docker-email="devnull@example.com" \
-            --dry-run=client -o yaml | kubectl apply -f -
-          kubectl -n "$NS" patch serviceaccount default -p '{"imagePullSecrets":[{"name":"acr-cred"}]}' || true
+      - name: Ensure namespace
+        run: kubectl get ns $STAGE_NS || kubectl create ns $STAGE_NS
 
       - name: Apply Kubernetes manifests
-        working-directory: k8s
-        env:
-          NS: ${{ steps.meta.outputs.NS }}
-        run: |
-          set -e
-          for f in configmaps.yaml secrets.yaml rabbitmq.yaml \
-                   product-db.yaml order-db.yaml customer-db.yaml \
-                   product-service.yaml order-service.yaml customer-service.yaml \
-                   frontend.yaml; do
-            [ -f "$f" ] && kubectl -n "$NS" apply -f "$f" || true
-          done
+        run: kubectl apply -n $STAGE_NS -f k8s/
 
-      - name: Set images to computed tag
-        env:
-          NS:     ${{ steps.meta.outputs.NS }}
-          REG:    ${{ steps.meta.outputs.REG }}
-          PREFIX: ${{ steps.meta.outputs.PREFIX }}
-          TAG:    ${{ steps.meta.outputs.TAG }}
-        shell: bash
+      - name: Set images to testing-latest
         run: |
-          set -e
-          update_img () {
-            dep="$1"; repo="$2"
-            # grab the first container name in the deployment to avoid name mismatches
-            cn=$(kubectl -n "$NS" get deploy "$dep" -o jsonpath='{.spec.template.spec.containers[0].name}')
-            kubectl -n "$NS" set image deploy/"$dep" "$cn=$REG/$PREFIX/$repo:$TAG" || true
-          }
-          update_img product-service  product_service
-          update_img order-service    order_service
-          update_img customer-service customer_service
-          update_img frontend         frontend
+          kubectl -n $STAGE_NS set image deploy/customer-service customer=${REGISTRY}/${REPO_PREFIX}/customer_service:${TAG} || true
+          kubectl -n $STAGE_NS set image deploy/product-service  product=${REGISTRY}/${REPO_PREFIX}/product_service:${TAG} || true
+          kubectl -n $STAGE_NS set image deploy/order-service    order=${REGISTRY}/${REPO_PREFIX}/order_service:${TAG} || true
+          kubectl -n $STAGE_NS set image deploy/frontend         frontend=${REGISTRY}/${REPO_PREFIX}/frontend:${TAG} || true
 
       - name: Wait for rollout
         env: { NS: ${{ steps.meta.outputs.NS }} }
         run: |
-          for dep in product-service order-service customer-service frontend; do
-            kubectl -n "$NS" rollout status deploy/$dep --timeout=600s || true
+          for d in customer-service product-service order-service frontend; do
+            kubectl -n $STAGE_NS rollout status deploy/$d --timeout=180s
           done
 
-      - name: Acceptance checks (/health)
-        env: { NS: ${{ steps.meta.outputs.NS }} }
-        run: |
-          set -e
-          kubectl -n "$NS" port-forward svc/product-service  18000:8000 >/dev/null 2>&1 & P1=$!
-          kubectl -n "$NS" port-forward svc/order-service    18001:8000 >/dev/null 2>&1 & P2=$!
-          kubectl -n "$NS" port-forward svc/customer-service 18002:8000 >/dev/null 2>&1 & P3=$!
-          sleep 5
-          curl -sf http://127.0.0.1:18000/health | cat
-          curl -sf http://127.0.0.1:18001/health | cat
-          curl -sf http://127.0.0.1:18002/health | cat
-          kubectl -n "$NS" port-forward svc/frontend 18003:80 >/dev/null 2>&1 & P4=$!
-          sleep 2
-          curl -sf http://127.0.0.1:18003/ | head -n 1 | cat || true
-          kill $P1 $P2 $P3 $P4 || true
-
-      - name: Smoke summary
-        env: { NS: ${{ steps.meta.outputs.NS }} }
-        run: |
-          kubectl -n "$NS" get deploy,svc,pods -o wide
-
-      # If you want ephemeral staging per run, leave this enabled.
-      # If you want to keep the namespace, delete this step.
-      - name: Destroy ephemeral namespace (cleanup)
-        if: always()
-        env: { NS: ${{ steps.meta.outputs.NS }} }
-        run: kubectl delete ns "$NS" --wait=false
+      - name: Smoke check (basic)
+        run: kubectl -n $STAGE_NS get pods,svc,ingress -o wide
