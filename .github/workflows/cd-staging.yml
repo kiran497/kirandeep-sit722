@@ -1,0 +1,66 @@
+name: CD (staging) - ephemeral AKS
+
+on:
+  workflow_run:
+    workflows: ["CI (testing) - tests → ACR push"]
+    types: [completed]
+    branches: [testing]
+
+env:
+  ACR_LOGIN_SERVER: ${{ secrets.ACR_LOGIN_SERVER }}
+  AKS_RG: ${{ vars.AKS_RESOURCE_GROUP }}        # rg-sit722-kiran
+  AKS_CLUSTER: ${{ vars.AKS_CLUSTER_NAME }}     # kiranaks722
+
+jobs:
+  staging:
+    if: ${{ github.event.workflow_run.conclusion == 'success' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: azure/login@v2
+        with: { creds: ${{ secrets.AZURE_CREDENTIALS }} }
+
+      - name: Set AKS context
+        uses: azure/aks-set-context@v4
+        with:
+          resource-group: ${{ env.AKS_RG }}
+          cluster-name:  ${{ env.AKS_CLUSTER }}
+
+      - name: Create ephemeral staging namespace
+        id: ns
+        run: |
+          NS="stg-sit722-kiran-${{ github.run_id }}"
+          kubectl create namespace $NS
+          echo "ns=$NS" >> $GITHUB_OUTPUT
+
+      - name: Apply base manifests to staging
+        run: kubectl -n ${{ steps.ns.outputs.ns }} apply -f k8s/
+
+      # Deployment/container names expected from your ZIP:
+      # customer-service, product-service, order-service, frontend
+      - name: Pin images to testing-latest
+        run: |
+          kubectl -n ${{ steps.ns.outputs.ns }} set image deployment/customer-service customer-service=${{ env.ACR_LOGIN_SERVER }}/sit722/customer_service:testing-latest
+          kubectl -n ${{ steps.ns.outputs.ns }} set image deployment/product-service  product-service=${{ env.ACR_LOGIN_SERVER }}/sit722/product_service:testing-latest
+          kubectl -n ${{ steps.ns.outputs.ns }} set image deployment/order-service    order-service=${{ env.ACR_LOGIN_SERVER }}/sit722/order_service:testing-latest
+          kubectl -n ${{ steps.ns.outputs.ns }} set image deployment/frontend         frontend=${{ env.ACR_LOGIN_SERVER }}/sit722/frontend:testing-latest
+
+      - name: Wait for rollouts
+        run: |
+          kubectl -n ${{ steps.ns.outputs.ns }} rollout status deployment/customer-service --timeout=120s
+          kubectl -n ${{ steps.ns.outputs.ns }} rollout status deployment/product-service  --timeout=120s
+          kubectl -n ${{ steps.ns.outputs.ns }} rollout status deployment/order-service    --timeout=120s
+          kubectl -n ${{ steps.ns.outputs.ns }} rollout status deployment/frontend         --timeout=120s
+
+      - name: Smoke test (frontend via port-forward)
+        run: |
+          kubectl -n ${{ steps.ns.outputs.ns }} port-forward svc/frontend 8080:80 &
+          PF=$!
+          sleep 5
+          curl -sSf http://127.0.0.1:8080/ > /dev/null
+          kill $PF || true
+
+      - name: Always delete staging namespace
+        if: always()
+        run: kubectl delete namespace ${{ steps.ns.outputs.ns }} --wait=false || true
