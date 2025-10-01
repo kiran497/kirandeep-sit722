@@ -2,151 +2,103 @@ name: CD - Stage 2 (Staging)
 
 on:
   workflow_run:
-    types: [completed]   # we gate to your CI below
-  workflow_dispatch:
-    inputs:
-      image_tag:
-        description: "ACR image tag (default: testing-latest)"
-        required: false
-        type: string
-      namespace_suffix:
-        description: "Override namespace suffix (default: short SHA)"
-        required: false
-        type: string
+    workflows: ["CI - Stage 1 (Testing + Build + Push)"]
+    types: [completed]
+  workflow_dispatch: {}
+
+permissions:
+  id-token: write
+  contents: read
 
 env:
-  REGISTRY:     ${{ secrets.ACR_LOGIN_SERVER }}         # kiranacr722.azurecr.io
-  REPO_PREFIX:  ${{ vars.REPO_PREFIX || 'sit722' }}     # sit722
-
-concurrency:
-  group: staging-${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || github.run_id }}
-  cancel-in-progress: true
+  AKS_RG: ${{ vars.AKS_RESOURCE_GROUP }}       # rg-sit722-kiran
+  AKS_CLUSTER: ${{ vars.AKS_CLUSTER_NAME }}    # kiranaks722
+  STAGE_NS: staging-sit722-kiran
+  REGISTRY: ${{ secrets.ACR_LOGIN_SERVER }}    # kiranacr722.azurecr.io
+  REPO_PREFIX: sit722
+  TAG: testing-latest
 
 jobs:
-  deploy-staging:
-    name: Deploy Staging
-    # manual OR CI succeeded, from head_branch 'testing', and the workflow was your CI
-    if: |
+  deploy:
+    if: >
       github.event_name == 'workflow_dispatch' ||
-      (github.event_name == 'workflow_run' &&
-       github.event.workflow_run.conclusion == 'success' &&
-       github.event.workflow_run.head_branch == 'testing' &&
-       github.event.workflow_run.name == 'CI - Stage 1 (Testing)')
+      (github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success')
     runs-on: ubuntu-latest
-    permissions: { id-token: write, contents: read }
-
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout testing branch (k8s here)
+        uses: actions/checkout@v4
+        with:
+          ref: testing
 
-      - name: Compute tag & namespace
-        id: meta
-        shell: bash
-        run: |
-          if [ "${{ github.event_name }}" = "workflow_run" ]; then
-            SHA="${{ github.event.workflow_run.head_sha }}"
-          else
-            SHA="${{ github.sha }}"
-          fi
-          SHORT="${SHA:0:7}"
-          TAG="${{ inputs.image_tag || '' }}"
-          TAG="${TAG:-testing-latest}"
-          SUFFIX="${{ inputs.namespace_suffix || '' }}"
-          SUFFIX="${SUFFIX:-$SHORT}"
-          NS="staging-$SUFFIX"
-          echo "TAG=$TAG"   >> $GITHUB_OUTPUT
-          echo "NS=$NS"     >> $GITHUB_OUTPUT
-          echo "REG=${{ env.REGISTRY }}" >> $GITHUB_OUTPUT
-          echo "PREF=${{ env.REPO_PREFIX }}" >> $GITHUB_OUTPUT
-
-      - name: Azure login
+      - name: Azure Login
         uses: azure/login@v2
-        with: { creds: ${{ secrets.AZURE_CREDENTIALS }} }
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
 
       - name: Set AKS context
         uses: azure/aks-set-context@v4
         with:
-          resource-group: ${{ vars.AKS_RESOURCE_GROUP }}   # rg-sit722-kiran
-          cluster-name:  ${{ vars.AKS_CLUSTER_NAME }}      # kiranaks722
+          resource-group: ${{ env.AKS_RG }}
+          cluster-name: ${{ env.AKS_CLUSTER }}
 
-      - name: Create staging namespace
+      - name: Ensure namespace
         run: |
-          kubectl get ns "${{ steps.meta.outputs.NS }}" >/dev/null 2>&1 || kubectl create ns "${{ steps.meta.outputs.NS }}"
+          kubectl get ns "${STAGE_NS}" >/dev/null 2>&1 || kubectl create ns "${STAGE_NS}"
+          kubectl get ns "${STAGE_NS}"
 
-      # Only needed if AKS is NOT attached to ACR; harmless otherwise
-      - name: Create imagePullSecret
-        env:
-          NS:  ${{ steps.meta.outputs.NS }}
-          REG: ${{ steps.meta.outputs.REG }}
-          ID:  ${{ fromJson(secrets.AZURE_CREDENTIALS).clientId }}
-          PW:  ${{ fromJson(secrets.AZURE_CREDENTIALS).clientSecret }}
+      - name: Create/Update ACR imagePullSecret (acr-cred)
         run: |
-          kubectl -n "$NS" create secret docker-registry acr-cred \
-            --docker-server="$REG" --docker-username="$ID" --docker-password="$PW" \
-            --docker-email="devnull@example.com" --dry-run=client -o yaml | kubectl apply -f -
-          kubectl -n "$NS" patch serviceaccount default -p '{"imagePullSecrets":[{"name":"acr-cred"}]}' || true
+          CLIENT_ID=$(jq -r '.clientId' <<< '${{ secrets.AZURE_CREDENTIALS }}')
+          CLIENT_SECRET=$(jq -r '.clientSecret' <<< '${{ secrets.AZURE_CREDENTIALS }}')
+          kubectl -n "${STAGE_NS}" delete secret acr-cred >/dev/null 2>&1 || true
+          kubectl -n "${STAGE_NS}" create secret docker-registry acr-cred \
+            --docker-server="${REGISTRY}" \
+            --docker-username="${CLIENT_ID}" \
+            --docker-password="${CLIENT_SECRET}"
+          kubectl -n "${STAGE_NS}" patch serviceaccount default \
+            -p '{"imagePullSecrets":[{"name":"acr-cred"}]}' || true
 
-      - name: Apply k8s manifests
-        working-directory: k8s
+      - name: Ensure DB secret
         run: |
-          NS="${{ steps.meta.outputs.NS }}"
-          kubectl -n "$NS" apply -f configmaps.yaml
-          kubectl -n "$NS" apply -f secrets.yaml || true
-          kubectl -n "$NS" apply -f rabbitmq.yaml
-          kubectl -n "$NS" apply -f product-db.yaml
-          kubectl -n "$NS" apply -f order-db.yaml
-          kubectl -n "$NS" apply -f customer-db.yaml
-          kubectl -n "$NS" apply -f product-service.yaml
-          kubectl -n "$NS" apply -f order-service.yaml
-          kubectl -n "$NS" apply -f customer-service.yaml
-          kubectl -n "$NS" apply -f frontend.yaml || true
+          kubectl -n "${STAGE_NS}" delete secret ecomm-secrets >/dev/null 2>&1 || true
+          kubectl -n "${STAGE_NS}" create secret generic ecomm-secrets \
+            --from-literal=POSTGRES_USER=postgres \
+            --from-literal=POSTGRES_PASSWORD=postgres
 
-      # build frontend tag if CI didn't
-      - name: Build & push frontend:testing-latest
+      - name: Apply entire k8s folder (Ahmad layout)
         run: |
-          az acr login --name $(echo "${{ env.REGISTRY }}" | cut -d. -f1)   # -> kiranacr722
-          docker build -t "${{ env.REGISTRY }}/${{ env.REPO_PREFIX }}/frontend:testing-latest" ./frontend
-          docker push    "${{ env.REGISTRY }}/${{ env.REPO_PREFIX }}/frontend:testing-latest"
+          test -d k8s
+          kubectl apply -n "${STAGE_NS}" -f k8s/
 
-      - name: Pin images to tag
+      - name: Stamp images (idempotent)
         run: |
-          NS="${{ steps.meta.outputs.NS }}"
-          REG="${{ steps.meta.outputs.REG }}"
-          PREF="${{ steps.meta.outputs.PREF }}"
-          TAG="${{ steps.meta.outputs.TAG }}"
-          kubectl -n "$NS" set image deploy/product-service  product="${REG}/${PREF}/product_service:${TAG}"   --record
-          kubectl -n "$NS" set image deploy/order-service    order="${REG}/${PREF}/order_service:${TAG}"       --record
-          kubectl -n "$NS" set image deploy/customer-service customer="${REG}/${PREF}/customer_service:${TAG}" --record
-          kubectl -n "$NS" set image deploy/frontend         frontend="${REG}/${PREF}/frontend:${TAG}"         --record
+          kubectl -n "${STAGE_NS}" set image deploy/customer-service customer=${REGISTRY}/${REPO_PREFIX}/customer_service:${TAG}
+          kubectl -n "${STAGE_NS}" set image deploy/product-service  product=${REGISTRY}/${REPO_PREFIX}/product_service:${TAG}
+          kubectl -n "${STAGE_NS}" set image deploy/order-service    order=${REGISTRY}/${REPO_PREFIX}/order_service:${TAG}
+          kubectl -n "${STAGE_NS}" set image deploy/frontend         frontend=${REGISTRY}/${REPO_PREFIX}/frontend:${TAG}
 
       - name: Wait for rollouts
         run: |
-          NS="${{ steps.meta.outputs.NS }}"
-          for d in product-service order-service customer-service frontend; do
-            kubectl -n "$NS" rollout status deploy/$d --timeout=600s
+          set -e
+          for d in customer-db product-db order-db customer-service product-service order-service frontend; do
+            echo "Waiting for $d..."
+            kubectl -n "${STAGE_NS}" rollout status deploy/$d --timeout=300s
           done
 
-      - name: Acceptance checks
+      - name: Smoke test
         run: |
           set -e
-          NS="${{ steps.meta.outputs.NS }}"
-          kubectl -n "$NS" port-forward svc/product-service   18000:8000 >/dev/null 2>&1 & P1=$!
-          kubectl -n "$NS" port-forward svc/order-service     18001:8000 >/dev/null 2>&1 & P2=$!
-          kubectl -n "$NS" port-forward svc/customer-service  18002:8000 >/dev/null 2>&1 & P3=$!
-          sleep 5
-          curl -sf http://127.0.0.1:18000/health | cat
-          curl -sf http://127.0.0.1:18001/health | cat
-          curl -sf http://127.0.0.1:18002/health | cat
-          kubectl -n "$NS" port-forward svc/frontend 18003:80 >/dev/null 2>&1 & P4=$!
-          sleep 2
-          curl -sf http://127.0.0.1:18003/ | head -n 1 | cat || true
-          kill $P1 $P2 $P3 $P4 || true
+          kubectl -n "${STAGE_NS}" run curl --image=curlimages/curl:8.10.1 --restart=Never --command -- \
+            sh -c '
+              echo "customer:" && curl -sf http://customer-service:8000/ && \
+              echo "product:"  && curl -sf http://product-service:8000/  && \
+              echo "order:"    && curl -sf http://order-service:8000/    && \
+              echo "OK"
+            '
+          kubectl -n "${STAGE_NS}" delete pod curl --ignore-not-found
 
-      - name: Show pods & services
-        run: |
-          NS="${{ steps.meta.outputs.NS }}"
-          kubectl -n "$NS" get pods -o wide
-          kubectl -n "$NS" get svc  -o wide
-
-      - name: Cleanup staging namespace
+      - name: Snapshot (for report)
         if: always()
-        run: kubectl delete ns "${{ steps.meta.outputs.NS }}" --wait=false
+        run: |
+          kubectl -n "${STAGE_NS}" get all -o wide
+          kubectl -n "${STAGE_NS}" get svc
