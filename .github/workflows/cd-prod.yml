@@ -1,132 +1,63 @@
 name: CD - Stage 3 (Production)
+
 on:
   push:
-    branches: [ "main" ]
+    branches: [main]
 
 env:
-  REGISTRY: ${{ secrets.ACR_LOGIN_SERVER }}
-  PROD_NAMESPACE: ${{ vars.PROD_NAMESPACE }}
+  REGISTRY:     ${{ secrets.ACR_LOGIN_SERVER }}         # kiranacr722.azurecr.io
+  REPO_PREFIX:  ${{ vars.REPO_PREFIX || 'sit722' }}     # sit722
 
 jobs:
-  build-and-deploy-prod:
-    name: Build and Deploy to Production
+  deploy-prod:
     runs-on: ubuntu-latest
-    permissions:
-      id-token: write
-      contents: read
+    permissions: { id-token: write, contents: read }
 
     steps:
       - uses: actions/checkout@v4
 
-      - name: Azure Login
+      - name: Azure login
         uses: azure/login@v2
-        with:
-          creds: ${{ secrets.AZURE_CREDENTIALS }}
+        with: { creds: ${{ secrets.AZURE_CREDENTIALS }} }
 
-      - name: Docker Login to ACR
-        uses: azure/docker-login@v2
-        with:
-          login-server: ${{ secrets.ACR_LOGIN_SERVER }}
-          username: ${{ fromJson(secrets.AZURE_CREDENTIALS).clientId }}
-          password: ${{ fromJson(secrets.AZURE_CREDENTIALS).clientSecret }}
+      - name: ACR login
+        run: az acr login --name $(echo "${{ env.REGISTRY }}" | cut -d. -f1)   # -> kiranacr722
 
-      - name: Build and Push Main Images
+      - name: Build & push main-latest images
         run: |
-          docker build -t $REGISTRY/customer_service:main-latest ./backend/customer_service
-          docker build -t $REGISTRY/order_service:main-latest    ./backend/order_service
-          docker build -t $REGISTRY/product_service:main-latest  ./backend/product_service
-          docker build -t $REGISTRY/frontend:main-latest         ./frontend
-          docker push $REGISTRY/customer_service:main-latest
-          docker push $REGISTRY/order_service:main-latest
-          docker push $REGISTRY/product_service:main-latest
-          docker push $REGISTRY/frontend:main-latest
+          for path in backend/customer_service backend/product_service backend/order_service frontend; do
+            svc=$(basename "$path")
+            docker build -t "${{ env.REGISTRY }}/${{ env.REPO_PREFIX }}/$svc:main-latest" "$path"
+            docker push    "${{ env.REGISTRY }}/${{ env.REPO_PREFIX }}/$svc:main-latest"
+          done
 
-      - name: Set AKS Context
+      - name: Set AKS context
         uses: azure/aks-set-context@v4
         with:
-          resource-group: ${{ vars.AKS_RESOURCE_GROUP }}
-          cluster-name: ${{ vars.AKS_CLUSTER_NAME }}
+          resource-group: ${{ vars.AKS_RESOURCE_GROUP }}   # rg-sit722-kiran
+          cluster-name:  ${{ vars.AKS_CLUSTER_NAME }}      # kiranaks722
 
-      - name: Create Prod Namespace if Needed
+      - name: Ensure prod namespace
         run: |
-          kubectl get ns $PROD_NAMESPACE || kubectl create ns $PROD_NAMESPACE
+          kubectl get ns "${{ vars.PROD_NAMESPACE }}" >/dev/null 2>&1 || kubectl create ns "${{ vars.PROD_NAMESPACE }}"
 
-      - name: Create ACR imagePullSecret in Prod Namespace
-        env:
-          REG: ${{ env.REGISTRY }}
-          SP_APP_ID: ${{ fromJson(secrets.AZURE_CREDENTIALS).clientId }}
-          SP_PASSWORD: ${{ fromJson(secrets.AZURE_CREDENTIALS).clientSecret }}
-        run: |
-          kubectl -n "$PROD_NAMESPACE" create secret docker-registry acr-cred \
-            --docker-server="$REG" \
-            --docker-username="$SP_APP_ID" \
-            --docker-password="$SP_PASSWORD" \
-            --docker-email="devnull@example.com" \
-            --dry-run=client -o yaml | kubectl apply -f -
-
-      - name: Patch ServiceAccount in Prod to use imagePullSecret
-        run: |
-          kubectl -n "$PROD_NAMESPACE" patch serviceaccount default -p '{"imagePullSecrets":[{"name":"acr-cred"}]}' || true
-
-      - name: Apply Manifests to Prod
+      - name: Apply manifests to prod
         working-directory: k8s
-        run: |
-          kubectl -n $PROD_NAMESPACE apply -f configmaps.yaml
-          kubectl -n $PROD_NAMESPACE apply -f secrets.yaml
-          kubectl -n $PROD_NAMESPACE apply -f rabbitmq.yaml
-          kubectl -n $PROD_NAMESPACE apply -f product-db.yaml
-          kubectl -n $PROD_NAMESPACE apply -f order-db.yaml
-          kubectl -n $PROD_NAMESPACE apply -f customer-db.yaml
-          kubectl -n $PROD_NAMESPACE apply -f product-service.yaml
-          kubectl -n $PROD_NAMESPACE apply -f order-service.yaml
-          kubectl -n $PROD_NAMESPACE apply -f customer-service.yaml
-          kubectl -n $PROD_NAMESPACE apply -f frontend.yaml || true
+        run: kubectl -n "${{ vars.PROD_NAMESPACE }}" apply -f .
 
-      - name: Pin Images to main-latest
+      - name: Pin images to main-latest
         run: |
-          kubectl -n $PROD_NAMESPACE set image deployment/product-service-w10-aks \
-            product-service-container=$REGISTRY/product_service:main-latest
-          kubectl -n $PROD_NAMESPACE set image deployment/order-service-w10-aks \
-            order-service-container=$REGISTRY/order_service:main-latest
-          kubectl -n $PROD_NAMESPACE set image deployment/customer-service-w10-aks \
-            customer-service-container=$REGISTRY/customer_service:main-latest
-          kubectl -n $PROD_NAMESPACE set image deployment/frontend-w10-aks \
-            frontend-container=$REGISTRY/frontend:main-latest || true
+          NS="${{ vars.PROD_NAMESPACE }}"                  # prod-sit722-kiran
+          REG="${{ env.REGISTRY }}"
+          PREF="${{ env.REPO_PREFIX }}"
+          kubectl -n "$NS" set image deploy/product-service  product="${REG}/${PREF}/product_service:main-latest"   --record
+          kubectl -n "$NS" set image deploy/order-service    order="${REG}/${PREF}/order_service:main-latest"       --record
+          kubectl -n "$NS" set image deploy/customer-service customer="${REG}/${PREF}/customer_service:main-latest" --record
+          kubectl -n "$NS" set image deploy/frontend         frontend="${REG}/${PREF}/frontend:main-latest"         --record
 
-      - name: Wait for Rollouts
+      - name: Wait for prod rollouts
         run: |
-          kubectl -n $PROD_NAMESPACE rollout status deployment/product-service-w10-aks --timeout=600s
-          kubectl -n $PROD_NAMESPACE rollout status deployment/order-service-w10-aks --timeout=600s
-          kubectl -n $PROD_NAMESPACE rollout status deployment/customer-service-w10-aks --timeout=600s
-          kubectl -n $PROD_NAMESPACE rollout status deployment/frontend-w10-aks --timeout=600s || true
-
-      - name: Diagnostics on Failure (describe, events, logs)
-        if: failure()
-        run: |
-          set +e
-          echo "== Pods =="
-          kubectl -n $PROD_NAMESPACE get pods -o wide | cat
-          echo "== ReplicaSets =="
-          kubectl -n $PROD_NAMESPACE get rs | cat
-          echo "== Events (last 200) =="
-          kubectl -n $PROD_NAMESPACE get events --sort-by=.lastTimestamp | tail -n 200 | cat
-          echo "== Describe product-service pods =="
-          for p in $(kubectl -n $PROD_NAMESPACE get pods -l app=product-service -o name); do
-            kubectl -n $PROD_NAMESPACE describe $p | sed -n '1,200p' | cat
-            kubectl -n $PROD_NAMESPACE logs $p --all-containers --tail=200 | cat || true
-          done
-          echo "== Describe order-service pods =="
-          for p in $(kubectl -n $PROD_NAMESPACE get pods -l app=order-service -o name); do
-            kubectl -n $PROD_NAMESPACE describe $p | sed -n '1,200p' | cat
-            kubectl -n $PROD_NAMESPACE logs $p --all-containers --tail=200 | cat || true
-          done
-          echo "== Describe customer-service pods =="
-          for p in $(kubectl -n $PROD_NAMESPACE get pods -l app=customer-service -o name); do
-            kubectl -n $PROD_NAMESPACE describe $p | sed -n '1,200p' | cat
-            kubectl -n $PROD_NAMESPACE logs $p --all-containers --tail=200 | cat || true
-          done
-          echo "== Describe frontend pods =="
-          for p in $(kubectl -n $PROD_NAMESPACE get pods -l app=frontend -o name); do
-            kubectl -n $PROD_NAMESPACE describe $p | sed -n '1,200p' | cat
-            kubectl -n $PROD_NAMESPACE logs $p --all-containers --tail=200 | cat || true
+          NS="${{ vars.PROD_NAMESPACE }}"
+          for d in product-service order-service customer-service frontend; do
+            kubectl -n "$NS" rollout status deploy/$d --timeout=600s
           done
