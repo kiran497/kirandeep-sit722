@@ -2,64 +2,122 @@ name: CD - Stage 2 (Staging)
 
 on:
   workflow_run:
-    workflows: ["CI - Stage 1 (Testing)", "CI — Verify, Build, Publish (testing)"]
-    types: [completed]
-
-permissions:
-  id-token: write
-  contents: read
+    workflows: ["CI - Stage 1 (Testing)"]
+    types: ["completed"]
+    branches: ["testing"]
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: "ACR image tag to deploy (default: testing-latest)"
+        required: false
+        type: string
 
 env:
   REGISTRY: ${{ secrets.ACR_LOGIN_SERVER }}
-  REPO_PREFIX: ${{ vars.REPO_PREFIX || 'sit722' }}
-  AKS_RG: ${{ vars.AKS_RG }}
-  AKS_CLUSTER: ${{ vars.AKS_CLUSTER }}
-  STAGE_NS: ${{ vars.STAGE_NS }}
-  TAG: testing-latest
+  STAGE_NS: ${{ vars.STAGE_NS }}            # set to staging-sit722-kiran
+  AKS_RG: ${{ vars.AKS_RESOURCE_GROUP }}
+  AKS_CLUSTER: ${{ vars.AKS_CLUSTER_NAME }}
+
+concurrency:
+  group: staging
+  cancel-in-progress: true
 
 jobs:
-  deploy:
-    if: >
-      ${{
-        github.event.workflow_run.conclusion == 'success' &&
-        github.event.workflow_run.head_branch == 'testing'
-      }}
+  deploy-staging:
+    name: Deploy Staging
+    if: |
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success')
     runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
 
     steps:
       - uses: actions/checkout@v4
-        with:
-          ref: ${{ github.event.workflow_run.head_sha }}
 
-      - name: Azure login
+      - name: Decide image tag
+        id: meta
+        run: |
+          TAG="${{ inputs.image_tag }}"
+          if [ -z "$TAG" ]; then TAG="testing-latest"; fi
+          echo "TAG=$TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Azure Login
         uses: azure/login@v2
         with:
           creds: ${{ secrets.AZURE_CREDENTIALS }}
 
-      - name: Set AKS context
+      - name: Set AKS Context
         uses: azure/aks-set-context@v4
         with:
           resource-group: ${{ env.AKS_RG }}
           cluster-name: ${{ env.AKS_CLUSTER }}
 
-      - name: Ensure namespace
-        run: kubectl get ns $STAGE_NS || kubectl create ns $STAGE_NS
-
-      - name: Apply Kubernetes manifests
-        run: kubectl apply -n $STAGE_NS -f k8s/
-
-      - name: Set images to testing-latest
+      - name: Ensure Staging Namespace
         run: |
-          kubectl -n $STAGE_NS set image deploy/customer-service customer=${REGISTRY}/${REPO_PREFIX}/customer_service:${TAG} || true
-          kubectl -n $STAGE_NS set image deploy/product-service  product=${REGISTRY}/${REPO_PREFIX}/product_service:${TAG} || true
-          kubectl -n $STAGE_NS set image deploy/order-service    order=${REGISTRY}/${REPO_PREFIX}/order_service:${TAG} || true
-          kubectl -n $STAGE_NS set image deploy/frontend         frontend=${REGISTRY}/${REPO_PREFIX}/frontend:${TAG} || true
+          kubectl get ns "$STAGE_NS" >/dev/null 2>&1 || kubectl create ns "$STAGE_NS"
 
-      - name: Wait for rollout
+      # If AKS is already integrated with ACR, these two steps are not necessary.
+      # - name: Create ACR imagePullSecret (optional)
+      #   run: |
+      #     kubectl -n "$STAGE_NS" create secret docker-registry acr-cred \
+      #       --docker-server="${{ env.REGISTRY }}" \
+      #       --docker-username="${{ fromJson(secrets.AZURE_CREDENTIALS).clientId }}" \
+      #       --docker-password="${{ fromJson(secrets.AZURE_CREDENTIALS).clientSecret }}" \
+      #       --docker-email="devnull@example.com" \
+      #       --dry-run=client -o yaml | kubectl apply -f -
+      #
+      # - name: Patch SA to use imagePullSecret (optional)
+      #   run: kubectl -n "$STAGE_NS" patch serviceaccount default -p '{"imagePullSecrets":[{"name":"acr-cred"}]}' || true
+
+      - name: Apply k8s Manifests
+        working-directory: k8s
         run: |
-          for d in customer-service product-service order-service frontend; do
-            kubectl -n $STAGE_NS rollout status deploy/$d --timeout=180s
+          kubectl -n "$STAGE_NS" apply -f configmaps.yaml
+          kubectl -n "$STAGE_NS" apply -f secrets.yaml || true
+          kubectl -n "$STAGE_NS" apply -f rabbitmq.yaml
+          kubectl -n "$STAGE_NS" apply -f product-db.yaml
+          kubectl -n "$STAGE_NS" apply -f order-db.yaml
+          kubectl -n "$STAGE_NS" apply -f customer-db.yaml
+          kubectl -n "$STAGE_NS" apply -f product-service.yaml
+          kubectl -n "$STAGE_NS" apply -f order-service.yaml
+          kubectl -n "$STAGE_NS" apply -f customer-service.yaml
+          kubectl -n "$STAGE_NS" apply -f frontend.yaml || true
+
+      - name: Set Images
+        run: |
+          TAG="${{ steps.meta.outputs.TAG }}"
+          REG="${{ env.REGISTRY }}"
+          NS="${{ env.STAGE_NS }}"
+          kubectl -n "$NS" set image deployment/product-service-w10-aks  product-service-container="$REG/product_service:$TAG"
+          kubectl -n "$NS" set image deployment/order-service-w10-aks    order-service-container="$REG/order_service:$TAG"
+          kubectl -n "$NS" set image deployment/customer-service-w10-aks customer-service-container="$REG/customer_service:$TAG"
+          kubectl -n "$NS" set image deployment/frontend-w10-aks         frontend-container="$REG/frontend:$TAG" || true
+
+      - name: Wait for Rollouts
+        run: |
+          NS="${{ env.STAGE_NS }}"
+          for d in product-service-w10-aks order-service-w10-aks customer-service-w10-aks frontend-w10-aks; do
+            kubectl -n "$NS" rollout status deployment/$d --timeout=600s || exit 1
           done
 
-      - name: Smoke check (basic)
-        run: kubectl -n $STAGE_NS get pods,svc,ingress -o wide
+      - name: Acceptance Checks (/health)
+        run: |
+          set -e
+          NS="${{ env.STAGE_NS }}"
+          kubectl -n "$NS" port-forward svc/product-service-w10-aks  18000:8000 >/dev/null 2>&1 &
+          P1=$!
+          kubectl -n "$NS" port-forward svc/order-service-w10-aks    18001:8000 >/dev/null 2>&1 &
+          P2=$!
+          kubectl -n "$NS" port-forward svc/customer-service-w10-aks 18002:8000 >/dev/null 2>&1 &
+          P3=$!
+          sleep 5
+          curl -sf http://127.0.0.1:18000/health | cat
+          curl -sf http://127.0.0.1:18001/health | cat
+          curl -sf http://127.0.0.1:18002/health | cat
+          kill $P1 $P2 $P3 || true
+
+      - name: Show resources
+        run: |
+          kubectl -n "$STAGE_NS" get deploy,po,svc,ing -o wide
