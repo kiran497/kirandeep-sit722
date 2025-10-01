@@ -1,54 +1,33 @@
 name: CD - Stage 2 (Staging)
 
 on:
+  # auto-run after your CI (Stage 1) finishes on `testing`
   workflow_run:
-    workflows: ["CI - Stage 1 (Testing)"]
+    workflows: ["CI - Stage 1 (Testing)"]   # must match the CI workflow name
     types: [completed]
+    branches: [testing]
+  # also allow manual run from the Actions tab
+  workflow_dispatch: {}
 
-permissions:
-  id-token: write
-  contents: read
-
-# prevent overlapping deploys
-concurrency:
-  group: staging-${{ github.event.workflow_run.head_sha || github.run_id }}
-  cancel-in-progress: true
-
-# global env
 env:
-  REGISTRY: ${{ secrets.ACR_LOGIN_SERVER }}
-  REPO_PREFIX: ${{ vars.REPO_PREFIX || 'sit722' }}
-  AKS_RG: ${{ vars.AKS_RG }}
-  AKS_CLUSTER: ${{ vars.AKS_CLUSTER }}
-  STAGE_NS: ${{ vars.STAGE_NS }}
-  TAG: testing-latest
+  # ----- inputs pulled from your repo Secrets/Variables -----
+  REGISTRY:        ${{ secrets.ACR_LOGIN_SERVER }}                 # e.g. kiranacr722aue.azurecr.io
+  REPO_PREFIX:     ${{ vars.REPO_PREFIX || 'sit722' }}             # you set 'sit722'
+  AKS_RG:          ${{ vars.AKS_RESOURCE_GROUP }}                  # rg-sit722-kiran
+  AKS_CLUSTER:     ${{ vars.AKS_CLUSTER_NAME }}                    # kiranaks722
+  STAGE_NS:        ${{ vars.STAGING_NAMESPACE }}                   # staging-sit722-kiran
+  TAG:             testing-latest                                  # what CI pushes for staging
 
 jobs:
   deploy:
-    if: >
-      ${{
-        github.event.workflow_run.conclusion == 'success' &&
-        github.event.workflow_run.head_branch == 'testing'
-      }}
+    # run only if CI succeeded
+    if: ${{ github.event.workflow_run.conclusion == 'success' }}
     runs-on: ubuntu-latest
-    permissions: { id-token: write, contents: read }
-
-    # ⬇️ Map repo VARIABLES to the env names used by the steps
-    env:
-      AKS_RG:         ${{ vars.AKS_RESOURCE_GROUP }}   # e.g. rg-sit722-kiran
-      AKS_CLUSTER:    ${{ vars.AKS_CLUSTER_NAME }}     # e.g. kiranaks722
-      STAGE_NS:       ${{ vars.STAGING_NAMESPACE }}    # e.g. staging-sit722-kiran
-      REPO_PREFIX:    ${{ vars.REPO_PREFIX || 'sit722' }}
-      TAG:            ${{ inputs.image_tag || 'testing-latest' }}
 
     steps:
-      # Checkout the commit that produced the images (for workflow_run),
-      # otherwise the current SHA for manual runs
       - uses: actions/checkout@v4
-        with:
-          ref: ${{ github.event.workflow_run.head_sha }}
 
-      - name: Azure login
+      - name: Azure login (Service Principal)
         uses: azure/login@v2
         with:
           creds: ${{ secrets.AZURE_CREDENTIALS }}
@@ -57,27 +36,77 @@ jobs:
         uses: azure/aks-set-context@v4
         with:
           resource-group: ${{ env.AKS_RG }}
-          cluster-name: ${{ env.AKS_CLUSTER }}
+          cluster-name:   ${{ env.AKS_CLUSTER }}
 
-      - name: Ensure namespace
-        run: kubectl get ns $STAGE_NS || kubectl create ns $STAGE_NS
-
-      - name: Apply Kubernetes manifests
-        run: kubectl apply -n $STAGE_NS -f k8s/
-
-      - name: Set images to testing-latest
+      - name: Sanity check variables
         run: |
-          kubectl -n $STAGE_NS set image deploy/customer-service customer=${REGISTRY}/${REPO_PREFIX}/customer_service:${TAG} || true
-          kubectl -n $STAGE_NS set image deploy/product-service  product=${REGISTRY}/${REPO_PREFIX}/product_service:${TAG} || true
-          kubectl -n $STAGE_NS set image deploy/order-service    order=${REGISTRY}/${REPO_PREFIX}/order_service:${TAG} || true
-          kubectl -n $STAGE_NS set image deploy/frontend         frontend=${REGISTRY}/${REPO_PREFIX}/frontend:${TAG} || true
+          echo "REGISTRY=${REGISTRY}"
+          echo "AKS_RG=${AKS_RG}"
+          echo "AKS_CLUSTER=${AKS_CLUSTER}"
+          echo "STAGE_NS=${STAGE_NS}"
+          test -n "${REGISTRY}" && test -n "${AKS_RG}" && test -n "${AKS_CLUSTER}" && test -n "${STAGE_NS}"
 
-      - name: Wait for rollout
-        env: { NS: ${{ steps.meta.outputs.NS }} }
+      - name: Ensure staging namespace exists (clean create)
+        run: |
+          kubectl delete ns "${STAGE_NS}" --ignore-not-found
+          kubectl create ns "${STAGE_NS}"
+
+      - name: Apply base Kubernetes manifests
+        run: |
+          kubectl apply -n "${STAGE_NS}" -f k8s/
+
+      # If CI didn’t build the frontend image, this guarantees it exists
+      - name: Build & push frontend image for staging
+        run: |
+          az acr login --name $(echo "${REGISTRY}" | cut -d. -f1)
+          docker build -t "${REGISTRY}/${REPO_PREFIX}/frontend:${TAG}" ./frontend
+          docker push "${REGISTRY}/${REPO_PREFIX}/frontend:${TAG}"
+
+      - name: Pin images to testing tag
+        run: |
+          kubectl set image -n "${STAGE_NS}" deploy/customer-service customer="${REGISTRY}/${REPO_PREFIX}/customer_service:${TAG}" --record
+          kubectl set image -n "${STAGE_NS}" deploy/product-service  product="${REGISTRY}/${REPO_PREFIX}/product_service:${TAG}"  --record
+          kubectl set image -n "${STAGE_NS}" deploy/order-service    order="${REGISTRY}/${REPO_PREFIX}/order_service:${TAG}"    --record
+          kubectl set image -n "${STAGE_NS}" deploy/frontend         frontend="${REGISTRY}/${REPO_PREFIX}/frontend:${TAG}"     --record
+
+      - name: Wait for rollouts
         run: |
           for d in customer-service product-service order-service frontend; do
-            kubectl -n $STAGE_NS rollout status deploy/$d --timeout=180s
+            echo "Waiting for rollout: $d"
+            kubectl rollout status deploy/$d -n "${STAGE_NS}" --timeout=300s
           done
 
-      - name: Smoke check (basic)
-        run: kubectl -n $STAGE_NS get pods,svc,ingress -o wide
+      - name: Show services & pods
+        run: |
+          kubectl -n "${STAGE_NS}" get svc,pods -o wide
+
+      - name: Smoke test (HTTP 200 from frontend)
+        run: |
+          kubectl -n "${STAGE_NS}" port-forward svc/frontend 8080:80 >/tmp/pf.log 2>&1 &
+          PF_PID=$!
+          sleep 6
+          set -e
+          curl -sSf http://127.0.0.1:8080 > /dev/null
+          kill $PF_PID || true
+
+      # Helpful diagnostics if something goes wrong
+      - name: Describe deployments (on failure)
+        if: failure()
+        run: |
+          for d in customer-service product-service order-service frontend; do
+            echo "----- DESCRIBE $d -----"
+            kubectl -n "${STAGE_NS}" describe deploy/$d || true
+          done
+
+      - name: Tail logs (on failure)
+        if: failure()
+        run: |
+          for d in customer-service product-service order-service frontend; do
+            echo "----- LOGS $d -----"
+            kubectl -n "${STAGE_NS}" logs deploy/$d --all-containers --tail=200 || true
+          done
+
+      # Destroy the staging environment as required by the task
+      - name: Delete staging namespace (cleanup)
+        if: always()
+        run: kubectl delete ns "${STAGE_NS}" --wait=true --ignore-not-found
