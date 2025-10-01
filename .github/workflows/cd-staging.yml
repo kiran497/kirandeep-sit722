@@ -2,7 +2,8 @@ name: CD - Stage 2 (Staging)
 
 on:
   workflow_run:
-    workflows: ["CI - Stage 1 (Testing + Build + Push)"]
+    workflows: ["CI - Stage 1 (Testing + Build + Push)", ".github/workflows/ci-testing.yml"]
+    branches: [testing]   
     types: [completed]
   workflow_dispatch: {}
 
@@ -21,14 +22,19 @@ env:
 jobs:
   deploy:
     if: >
-      github.event_name == 'workflow_dispatch' ||
-      (github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success')
+      (github.event_name == 'workflow_run' &&
+       (github.event.workflow_run.name == 'CI - Stage 1 (Testing + Build + Push)' ||
+        endsWith(github.event.workflow_run.path, '/.github/workflows/ci-testing.yml')) &&
+       github.event.workflow_run.conclusion == 'success')
+      || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
+
     steps:
-      - name: Checkout testing branch (k8s here)
+      - name: Checkout testing branch (k8s lives here)
         uses: actions/checkout@v4
         with:
           ref: testing
+          fetch-depth: 1
 
       - name: Azure Login
         uses: azure/login@v2
@@ -48,7 +54,7 @@ jobs:
 
       - name: Create/Update ACR imagePullSecret (acr-cred)
         run: |
-          CLIENT_ID=$(jq -r '.clientId' <<< '${{ secrets.AZURE_CREDENTIALS }}')
+          CLIENT_ID=$(jq -r '.clientId'    <<< '${{ secrets.AZURE_CREDENTIALS }}')
           CLIENT_SECRET=$(jq -r '.clientSecret' <<< '${{ secrets.AZURE_CREDENTIALS }}')
           kubectl -n "${STAGE_NS}" delete secret acr-cred >/dev/null 2>&1 || true
           kubectl -n "${STAGE_NS}" create secret docker-registry acr-cred \
@@ -58,31 +64,49 @@ jobs:
           kubectl -n "${STAGE_NS}" patch serviceaccount default \
             -p '{"imagePullSecrets":[{"name":"acr-cred"}]}' || true
 
-      - name: Ensure DB secret
+      - name: Ensure DB secret (ecomm-secrets)
         run: |
           kubectl -n "${STAGE_NS}" delete secret ecomm-secrets >/dev/null 2>&1 || true
           kubectl -n "${STAGE_NS}" create secret generic ecomm-secrets \
             --from-literal=POSTGRES_USER=postgres \
             --from-literal=POSTGRES_PASSWORD=postgres
 
-      - name: Apply entire k8s folder (Ahmad layout)
+      # ---- Deploy DBs first and wait ----
+      - name: Apply DB manifests first
         run: |
-          test -d k8s
-          kubectl apply -n "${STAGE_NS}" -f k8s/
+          kubectl -n "${STAGE_NS}" apply -f k8s/customer-db.yaml
+          kubectl -n "${STAGE_NS}" apply -f k8s/product-db.yaml
+          kubectl -n "${STAGE_NS}" apply -f k8s/order-db.yaml
 
-      - name: Stamp images (idempotent)
+      - name: Wait for DB rollouts
+        run: |
+          set -e
+          for d in customer-db product-db order-db; do
+            echo "Waiting for $d..."
+            kubectl -n "${STAGE_NS}" rollout status deploy/$d --timeout=240s
+          done
+
+      # ---- Deploy apps and stamp images ----
+      - name: Apply app manifests
+        run: |
+          kubectl -n "${STAGE_NS}" apply -f k8s/customer-service.yaml
+          kubectl -n "${STAGE_NS}" apply -f k8s/product-service.yaml
+          kubectl -n "${STAGE_NS}" apply -f k8s/order-service.yaml
+          kubectl -n "${STAGE_NS}" apply -f k8s/frontend.yaml
+
+      - name: Pin images to testing-latest
         run: |
           kubectl -n "${STAGE_NS}" set image deploy/customer-service customer=${REGISTRY}/${REPO_PREFIX}/customer_service:${TAG}
           kubectl -n "${STAGE_NS}" set image deploy/product-service  product=${REGISTRY}/${REPO_PREFIX}/product_service:${TAG}
           kubectl -n "${STAGE_NS}" set image deploy/order-service    order=${REGISTRY}/${REPO_PREFIX}/order_service:${TAG}
           kubectl -n "${STAGE_NS}" set image deploy/frontend         frontend=${REGISTRY}/${REPO_PREFIX}/frontend:${TAG}
 
-      - name: Wait for rollouts
+      - name: Wait for app rollouts
         run: |
           set -e
-          for d in customer-db product-db order-db customer-service product-service order-service frontend; do
+          for d in customer-service product-service order-service frontend; do
             echo "Waiting for $d..."
-            kubectl -n "${STAGE_NS}" rollout status deploy/$d --timeout=300s
+            kubectl -n "${STAGE_NS}" rollout status deploy/$d --timeout=420s
           done
 
       - name: Smoke test
@@ -97,7 +121,17 @@ jobs:
             '
           kubectl -n "${STAGE_NS}" delete pod curl --ignore-not-found
 
-      - name: Snapshot (for report)
+      - name: Debug on failure
+        if: failure()
+        run: |
+          echo "=== Pods ==="
+          kubectl -n "${STAGE_NS}" get pods -o wide
+          for d in customer-service product-service order-service; do
+            echo "==== DESCRIBE $d ===="; kubectl -n "${STAGE_NS}" describe deploy/$d | sed -n '1,200p' || true
+            echo "==== LOGS $d ====";     kubectl -n "${STAGE_NS}" logs deploy/$d --tail=200 || true
+          done
+
+      - name: Snapshot (always)
         if: always()
         run: |
           kubectl -n "${STAGE_NS}" get all -o wide
