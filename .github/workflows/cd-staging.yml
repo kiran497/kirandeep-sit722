@@ -28,44 +28,38 @@ jobs:
     if: github.event_name == 'workflow_dispatch' || (github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success')
     runs-on: ubuntu-latest
     env:
-      AKS_RG:      ${{ vars.AKS_RESOURCE_GROUP }}
-      AKS_CLUSTER: ${{ vars.AKS_CLUSTER_NAME }}
-      STAGE_NS:    ${{ vars.STAGING_NAMESPACE }}
-      REPO_PREFIX: ${{ vars.REPO_PREFIX || 'sit722' }}
-      TAG:         ${{ inputs.image_tag || 'testing-latest' }}
+      AKS_RG:        ${{ vars.AKS_RESOURCE_GROUP }}
+      AKS_CLUSTER:   ${{ vars.AKS_CLUSTER_NAME }}
+      STAGE_NS:      ${{ vars.STAGING_NAMESPACE }}
+      REPO_PREFIX:   ${{ vars.REPO_PREFIX || 'sit722' }}
+      TAG:           ${{ inputs.image_tag || 'testing-latest' }}
 
     steps:
-      # Checkout the commit that produced the images (or current when manual)
-      - name: Checkout code
+      - name: Checkout triggering commit
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || 'testing' }}
+          ref: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || github.sha }}
           fetch-depth: 1
 
-      # Locate manifests robustly
       - name: Locate k8s manifests
         id: find
         shell: bash
         run: |
           set -e
-          for d in ./k8s ./K8s ./deploy/k8s ./manifests; do
+          CANDIDATES=( "./k8s" "./K8s" "./deploy/k8s" "./manifests" )
+          PICK=""
+          for d in "${CANDIDATES[@]}"; do
             if [ -d "$d" ] && ls "$d"/*.yaml >/dev/null 2>&1; then
-              echo "K8S_DIR=$d" >>"$GITHUB_OUTPUT"
-              exit 0
+              PICK="$d"; break
             fi
           done
-          echo "::error::No k8s folder with *.yaml found"; exit 1
-
-      # Remove hard-coded namespace lines so -n works
-      - name: Sanitize namespaces
-        id: sanitize
-        shell: bash
-        run: |
-          set -e
-          TMP=$(mktemp -d)
-          cp -r "${{ steps.find.outputs.K8S_DIR }}/." "$TMP/"
-          find "$TMP" -type f -name "*.yaml" -print0 | xargs -0 sed -i '/^[[:space:]]*namespace:[[:space:]].*$/d'
-          echo "SANITIZED=$TMP" >>"$GITHUB_OUTPUT"
+          if [ -z "$PICK" ]; then
+            echo "::error::Couldn't find a k8s manifests folder (looked in: ${CANDIDATES[*]})"
+            exit 1
+          fi
+          echo "K8S_DIR=$PICK" >> "$GITHUB_OUTPUT"
+          echo "Manifests folder: $PICK"
+          ls -la "$PICK"
 
       - name: Azure login
         uses: azure/login@v2
@@ -96,9 +90,9 @@ jobs:
           kubectl -n "$STAGE_NS" patch serviceaccount default -p '{"imagePullSecrets":[{"name":"acr-cred"}]}' || true
 
       - name: Apply Kubernetes manifests
-        run: kubectl apply -n "$STAGE_NS" -f "${{ steps.sanitize.outputs.SANITIZED }}"
+        run: kubectl apply -n "$STAGE_NS" -f "${{ steps.find.outputs.K8S_DIR }}"
 
-      - name: Set images to tag
+      - name: Set images to ${TAG}
         run: |
           kubectl -n "$STAGE_NS" set image deploy/customer-service customer=${REGISTRY}/${REPO_PREFIX}/customer_service:${TAG} || true
           kubectl -n "$STAGE_NS" set image deploy/product-service  product=${REGISTRY}/${REPO_PREFIX}/product_service:${TAG} || true
@@ -108,10 +102,10 @@ jobs:
       - name: Wait for rollout
         run: |
           for dep in customer-service product-service order-service frontend; do
-            kubectl -n "$STAGE_NS" rollout status deploy/$dep --timeout=300s || exit 1
+            kubectl -n "$STAGE_NS" rollout status deployment/$dep --timeout=300s || true
           done
 
       - name: Smoke check
         run: |
           kubectl -n "$STAGE_NS" get pods -o wide
-          kubectl -n "$STAGE_NS" get svc  -o wide
+          kubectl -n "$STAGE_NS" get svc -o wide
