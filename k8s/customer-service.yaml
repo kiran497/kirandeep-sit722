@@ -4,8 +4,7 @@ kind: Service
 metadata:
   name: customer-service
 spec:
-  selector:
-    app: customer-service
+  selector: { app: customer-service }
   ports:
     - port: 8000
       targetPort: 8000
@@ -15,21 +14,14 @@ kind: Deployment
 metadata:
   name: customer-service
 spec:
-  strategy:
-    type: Recreate
+  strategy: { type: Recreate }
   replicas: 1
-  selector:
-    matchLabels:
-      app: customer-service
+  selector: { matchLabels: { app: customer-service } }
   template:
-    metadata:
-      labels:
-        app: customer-service
+    metadata: { labels: { app: customer-service } }
     spec:
-      imagePullSecrets:
-        - name: acr-cred
+      imagePullSecrets: [{ name: acr-cred }]
       terminationGracePeriodSeconds: 10
-      # Wait for Postgres before starting the app
       initContainers:
         - name: wait-for-db
           image: busybox:1.36
@@ -37,29 +29,17 @@ spec:
       containers:
         - name: customer
           image: kiranacr722.azurecr.io/sit722/customer_service:testing-latest
-          ports:
-            - containerPort: 8000
+          ports: [{ containerPort: 8000 }]
           readinessProbe:
-            httpGet:
-              path: /          # change if your service health path differs
-              port: 8000
+            tcpSocket: { port: 8000 }
             initialDelaySeconds: 5
             periodSeconds: 5
             failureThreshold: 12
           env:
-            - name: POSTGRES_HOST
-              value: customer-db
-            - name: POSTGRES_PORT
-              value: "5432"
-            - name: POSTGRES_DB
-              value: customers
+            - { name: POSTGRES_HOST, value: customer-db }
+            - { name: POSTGRES_PORT, value: "5432" }
+            - { name: POSTGRES_DB,   value: customers }
             - name: POSTGRES_USER
-              valueFrom:
-                secretKeyRef:
-                  name: ecomm-secrets
-                  key: POSTGRES_USER
+              valueFrom: { secretKeyRef: { name: ecomm-secrets, key: POSTGRES_USER } }
             - name: POSTGRES_PASSWORD
-              valueFrom:
-                secretKeyRef:
-                  name: ecomm-secrets
-                  key: POSTGRES_PASSWORD
+              valueFrom: { secretKeyRef: { name: ecomm-secrets, key: POSTGRES_PASSWORD } }
