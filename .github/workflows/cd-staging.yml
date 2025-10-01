@@ -2,7 +2,8 @@ name: CD - Stage 2 (Staging)
 
 on:
   workflow_run:
-    workflows: ["CI - Stage 1 (Testing)"]   # must match your CI workflow name
+    workflows: ["CI - Stage 1 (Testing)", ".github/workflows/ci-testing.yml"]
+    branches: [testing]           # fire only when CI finishes on testing branch
     types: [completed]
   workflow_dispatch: {}
 
@@ -11,18 +12,20 @@ permissions:
   contents: read
 
 env:
-  REGISTRY: ${{ secrets.ACR_LOGIN_SERVER }}        # e.g. kiranacr722.azurecr.io
+  REGISTRY: ${{ secrets.ACR_LOGIN_SERVER }}   # e.g. kiranacr722.azurecr.io
   REPO_PREFIX: sit722
-  AKS_RG: ${{ vars.AKS_RESOURCE_GROUP }}           # rg-sit722-kiran
-  AKS_CLUSTER: ${{ vars.AKS_CLUSTER_NAME }}        # kiranaks722
+  AKS_RG: ${{ vars.AKS_RESOURCE_GROUP }}      # rg-sit722-kiran
+  AKS_CLUSTER: ${{ vars.AKS_CLUSTER_NAME }}   # kiranaks722
   STAGE_NS: staging-sit722-kiran
   TAG: testing-latest
 
 jobs:
   deploy-staging:
     if: >
-      github.event_name == 'workflow_dispatch' ||
-      (github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success')
+      (github.event_name == 'workflow_run' &&
+       github.event.workflow_run.name == 'CI - Stage 1 (Testing)' &&
+       github.event.workflow_run.conclusion == 'success')
+      || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
 
     steps:
@@ -30,6 +33,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: testing
+          fetch-depth: 1
 
       - name: Azure Login
         uses: azure/login@v2
@@ -49,7 +53,7 @@ jobs:
 
       - name: Create/Update ACR imagePullSecret (acr-cred)
         run: |
-          CLIENT_ID=$(jq -r '.clientId'    <<< '${{ secrets.AZURE_CREDENTIALS }}')
+          CLIENT_ID=$(jq -r '.clientId' <<< '${{ secrets.AZURE_CREDENTIALS }}')
           CLIENT_SECRET=$(jq -r '.clientSecret' <<< '${{ secrets.AZURE_CREDENTIALS }}')
           kubectl -n "${{ env.STAGE_NS }}" delete secret acr-cred >/dev/null 2>&1 || true
           kubectl -n "${{ env.STAGE_NS }}" create secret docker-registry acr-cred \
@@ -68,7 +72,7 @@ jobs:
 
       - name: Apply all k8s manifests
         run: |
-          test -d k8s
+          ls -la k8s
           kubectl -n "${{ env.STAGE_NS }}" apply -f k8s/
 
       - name: Pin images to testing-latest
