@@ -3,9 +3,13 @@ name: CD - Stage 2 (Staging)
 on:
   workflow_run:
     workflows: ["CI - Stage 1 (Testing + Build + Push)", ".github/workflows/ci-testing.yml"]
-    branches: [testing]   
+    branches: [testing]             
     types: [completed]
-  workflow_dispatch: {}
+  workflow_dispatch: {}          
+
+concurrency:
+  group: staging-${{ github.event.workflow_run.head_sha || github.sha }}
+  cancel-in-progress: true
 
 permissions:
   id-token: write
@@ -21,11 +25,11 @@ env:
 
 jobs:
   deploy:
+    # run ONLY when CI on 'testing' succeeded
     if: >
       (github.event_name == 'workflow_run' &&
-       (github.event.workflow_run.name == 'CI - Stage 1 (Testing + Build + Push)' ||
-        endsWith(github.event.workflow_run.path, '/.github/workflows/ci-testing.yml')) &&
-       github.event.workflow_run.conclusion == 'success')
+       github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.head_branch == 'testing')
       || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
 
@@ -71,9 +75,10 @@ jobs:
             --from-literal=POSTGRES_USER=postgres \
             --from-literal=POSTGRES_PASSWORD=postgres
 
-      # ---- Deploy DBs first and wait ----
+      # ---------- DBs first ----------
       - name: Apply DB manifests first
         run: |
+          ls -la k8s
           kubectl -n "${STAGE_NS}" apply -f k8s/customer-db.yaml
           kubectl -n "${STAGE_NS}" apply -f k8s/product-db.yaml
           kubectl -n "${STAGE_NS}" apply -f k8s/order-db.yaml
@@ -86,20 +91,13 @@ jobs:
             kubectl -n "${STAGE_NS}" rollout status deploy/$d --timeout=240s
           done
 
-      # ---- Deploy apps and stamp images ----
+      # ---------- Apps (single rollout; images should already be in the YAML) ----------
       - name: Apply app manifests
         run: |
           kubectl -n "${STAGE_NS}" apply -f k8s/customer-service.yaml
           kubectl -n "${STAGE_NS}" apply -f k8s/product-service.yaml
           kubectl -n "${STAGE_NS}" apply -f k8s/order-service.yaml
           kubectl -n "${STAGE_NS}" apply -f k8s/frontend.yaml
-
-      - name: Pin images to testing-latest
-        run: |
-          kubectl -n "${STAGE_NS}" set image deploy/customer-service customer=${REGISTRY}/${REPO_PREFIX}/customer_service:${TAG}
-          kubectl -n "${STAGE_NS}" set image deploy/product-service  product=${REGISTRY}/${REPO_PREFIX}/product_service:${TAG}
-          kubectl -n "${STAGE_NS}" set image deploy/order-service    order=${REGISTRY}/${REPO_PREFIX}/order_service:${TAG}
-          kubectl -n "${STAGE_NS}" set image deploy/frontend         frontend=${REGISTRY}/${REPO_PREFIX}/frontend:${TAG}
 
       - name: Wait for app rollouts
         run: |
