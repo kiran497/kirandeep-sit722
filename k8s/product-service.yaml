@@ -3,17 +3,18 @@ kind: Deployment
 metadata:
   name: product-service
 spec:
+  strategy:
+    type: Recreate                  
   replicas: 1
   selector:
-    matchLabels:
-      app: product-service
+    matchLabels: { app: product-service }
   template:
     metadata:
-      labels:
-        app: product-service
+      labels: { app: product-service }
     spec:
       imagePullSecrets:
         - name: acr-cred
+      terminationGracePeriodSeconds: 10
       initContainers:
         - name: wait-for-db
           image: busybox:1.36
@@ -21,8 +22,7 @@ spec:
       containers:
         - name: product
           image: kiranacr722.azurecr.io/sit722/product_service:testing-latest
-          ports:
-            - containerPort: 8000
+          ports: [{ containerPort: 8000 }]
           readinessProbe:
             httpGet: { path: /, port: 8000 }
             initialDelaySeconds: 5
