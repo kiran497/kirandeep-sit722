@@ -2,29 +2,33 @@ name: CD - Stage 2 (Staging)
 
 on:
   workflow_run:
-    workflows: ["CI - Stage 1 (Testing)", ".github/workflows/ci-testing.yml"]
-    branches: [testing]           # fire only when CI finishes on testing branch
+    workflows: ["CI - Stage 1 (Testing + Build + Push)", ".github/workflows/ci-testing.yml"]
+    branches: [testing]
     types: [completed]
   workflow_dispatch: {}
+
+concurrency:
+  group: staging-${{ github.event.workflow_run.head_sha || github.sha }}
+  cancel-in-progress: true
 
 permissions:
   id-token: write
   contents: read
 
 env:
-  REGISTRY: ${{ secrets.ACR_LOGIN_SERVER }}   # e.g. kiranacr722.azurecr.io
-  REPO_PREFIX: sit722
-  AKS_RG: ${{ vars.AKS_RESOURCE_GROUP }}      # rg-sit722-kiran
-  AKS_CLUSTER: ${{ vars.AKS_CLUSTER_NAME }}   # kiranaks722
+  AKS_RG: ${{ vars.AKS_RESOURCE_GROUP }}       # rg-sit722-kiran
+  AKS_CLUSTER: ${{ vars.AKS_CLUSTER_NAME }}    # kiranaks722
   STAGE_NS: staging-sit722-kiran
+  REGISTRY: ${{ secrets.ACR_LOGIN_SERVER }}    # kiranacr722.azurecr.io
+  REPO_PREFIX: sit722
   TAG: testing-latest
 
 jobs:
-  deploy-staging:
+  deploy:
     if: >
       (github.event_name == 'workflow_run' &&
-       github.event.workflow_run.name == 'CI - Stage 1 (Testing)' &&
-       github.event.workflow_run.conclusion == 'success')
+       github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.head_branch == 'testing')
       || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
 
@@ -48,56 +52,66 @@ jobs:
 
       - name: Ensure namespace
         run: |
-          kubectl get ns "${{ env.STAGE_NS }}" >/dev/null 2>&1 || kubectl create ns "${{ env.STAGE_NS }}"
-          kubectl get ns "${{ env.STAGE_NS }}"
+          kubectl get ns "${STAGE_NS}" >/dev/null 2>&1 || kubectl create ns "${STAGE_NS}"
+          kubectl get ns "${STAGE_NS}"
 
       - name: Create/Update ACR imagePullSecret (acr-cred)
         run: |
-          CLIENT_ID=$(jq -r '.clientId' <<< '${{ secrets.AZURE_CREDENTIALS }}')
+          CLIENT_ID=$(jq -r '.clientId'    <<< '${{ secrets.AZURE_CREDENTIALS }}')
           CLIENT_SECRET=$(jq -r '.clientSecret' <<< '${{ secrets.AZURE_CREDENTIALS }}')
-          kubectl -n "${{ env.STAGE_NS }}" delete secret acr-cred >/dev/null 2>&1 || true
-          kubectl -n "${{ env.STAGE_NS }}" create secret docker-registry acr-cred \
-            --docker-server="${{ env.REGISTRY }}" \
-            --docker-username="$CLIENT_ID" \
-            --docker-password="$CLIENT_SECRET"
-          kubectl -n "${{ env.STAGE_NS }}" patch serviceaccount default \
-            -p '{"imagePullSecrets":[{"name":"acr-cred"}]}' || true
+          kubectl -n "${STAGE_NS}" delete secret acr-cred >/dev/null 2>&1 || true
+          kubectl -n "${STAGE_NS}" create secret docker-registry acr-cred \
+            --docker-server="${REGISTRY}" --docker-username="${CLIENT_ID}" --docker-password="${CLIENT_SECRET}"
+          kubectl -n "${STAGE_NS}" patch serviceaccount default -p '{"imagePullSecrets":[{"name":"acr-cred"}]}' || true
 
       - name: Ensure DB secret (ecomm-secrets)
         run: |
-          kubectl -n "${{ env.STAGE_NS }}" delete secret ecomm-secrets >/dev/null 2>&1 || true
-          kubectl -n "${{ env.STAGE_NS }}" create secret generic ecomm-secrets \
+          kubectl -n "${STAGE_NS}" delete secret ecomm-secrets >/dev/null 2>&1 || true
+          kubectl -n "${STAGE_NS}" create secret generic ecomm-secrets \
             --from-literal=POSTGRES_USER=postgres \
             --from-literal=POSTGRES_PASSWORD=postgres
 
-      - name: Apply all k8s manifests
+      # ---------- Apply DBs then apps (no rollout status) ----------
+      - name: Apply DB manifests
         run: |
-          ls -la k8s
-          kubectl -n "${{ env.STAGE_NS }}" apply -f k8s/
+          kubectl -n "${STAGE_NS}" apply -f k8s/customer-db.yaml
+          kubectl -n "${STAGE_NS}" apply -f k8s/product-db.yaml
+          kubectl -n "${STAGE_NS}" apply -f k8s/order-db.yaml
+          echo "Giving Postgres a head start..."
+          sleep 15
 
-      - name: Pin images to testing-latest
+      - name: Apply app manifests
         run: |
-          kubectl -n "${{ env.STAGE_NS }}" set image deploy/customer-service customer=${{ env.REGISTRY }}/${{ env.REPO_PREFIX }}/customer_service:${{ env.TAG }}
-          kubectl -n "${{ env.STAGE_NS }}" set image deploy/product-service  product=${{ env.REGISTRY }}/${{ env.REPO_PREFIX }}/product_service:${{ env.TAG }}
-          kubectl -n "${{ env.STAGE_NS }}" set image deploy/order-service    order=${{ env.REGISTRY }}/${{ env.REPO_PREFIX }}/order_service:${{ env.TAG }}
-          kubectl -n "${{ env.STAGE_NS }}" set image deploy/frontend         frontend=${{ env.REGISTRY }}/${{ env.REPO_PREFIX }}/frontend:${{ env.TAG }}
+          kubectl -n "${STAGE_NS}" apply -f k8s/customer-service.yaml
+          kubectl -n "${STAGE_NS}" apply -f k8s/product-service.yaml
+          kubectl -n "${STAGE_NS}" apply -f k8s/order-service.yaml
+          kubectl -n "${STAGE_NS}" apply -f k8s/frontend.yaml
 
-      - name: Wait for rollouts
+      # ---------- Retry-based readiness instead of rollout ----------
+      - name: Retry smoke test (no rollout)
         run: |
           set -e
-          for d in customer-db product-db order-db customer-service product-service order-service frontend; do
-            echo "Waiting for $d..."
-            kubectl -n "${{ env.STAGE_NS }}" rollout status deploy/$d --timeout=300s
+          kubectl -n "${STAGE_NS}" run curl --image=curlimages/curl:8.10.1 --restart=Never --command -- sleep 3600
+          for svc in customer-service product-service order-service; do
+            echo "Waiting for $svc to respond on :8000 ..."
+            i=0
+            until kubectl -n "${STAGE_NS}" exec curl -- sh -c "curl -sf http://$svc:8000/ >/dev/null"; do
+              i=$((i+1))
+              if [ $i -ge 90 ]; then
+                echo "ERROR: $svc did not respond after $i attempts."
+                kubectl -n "${STAGE_NS}" get pods -o wide
+                kubectl -n "${STAGE_NS}" describe deploy/$svc | sed -n '1,200p' || true
+                kubectl -n "${STAGE_NS}" logs deploy/$svc --tail=200 || true
+                exit 1
+              fi
+              sleep 5
+            done
+            echo "$svc OK"
           done
+          kubectl -n "${STAGE_NS}" delete pod curl --ignore-not-found
 
-      - name: Smoke test
+      - name: Snapshot (always)
+        if: always()
         run: |
-          set -e
-          kubectl -n "${{ env.STAGE_NS }}" run curl --image=curlimages/curl:8.10.1 --restart=Never --command -- \
-            sh -c '
-              echo "customer:" && curl -sf http://customer-service:8000/ && \
-              echo "product:"  && curl -sf http://product-service:8000/  && \
-              echo "order:"    && curl -sf http://order-service:8000/    && \
-              echo "OK"
-            '
-          kubectl -n "${{ env.STAGE_NS }}" delete pod curl --ignore-not-found
+          kubectl -n "${STAGE_NS}" get all -o wide
+          kubectl -n "${STAGE_NS}" get svc
