@@ -13,9 +13,7 @@ permissions:
 env:
   REGISTRY:    ${{ secrets.ACR_LOGIN_SERVER }}
   REPO_PREFIX: ${{ vars.REPO_PREFIX || 'sit722' }}
-  AKS_RG:      ${{ vars.AKS_RG }}
-  AKS_CLUSTER: ${{ vars.AKS_CLUSTER }}
-  STAGE_NS:    ${{ vars.STAGE_NS }}
+  STAGE_NS:    ${{ vars.STAGE_NS || 'staging-sit722-kiran' }}
   TAG: testing-latest
 
 jobs:
@@ -33,8 +31,8 @@ jobs:
       - name: Set AKS context
         uses: azure/aks-set-context@v4
         with:
-          resource-group: ${{ env.AKS_RG }}
-          cluster-name:   ${{ env.AKS_CLUSTER }}
+          resource-group: ${{ vars.AKS_RG || 'rg-sit722-kiran' }}
+          cluster-name:   ${{ vars.AKS_CLUSTER || 'kiranaks722' }}
 
       - name: Ensure namespace
         run: kubectl get ns "$STAGE_NS" || kubectl create ns "$STAGE_NS"
@@ -44,10 +42,6 @@ jobs:
 
       - name: Set images to testing-latest
         run: |
-          for img in customer_service product_service order_service frontend; do
-            dep="${img/_service/-service}"     # map to your deployment names if needed
-            cont="${dep/-service/-service-container}" || true
-          done
           kubectl -n "$STAGE_NS" set image deploy/customer-service customer=${REGISTRY}/${REPO_PREFIX}/customer_service:${TAG} || true
           kubectl -n "$STAGE_NS" set image deploy/product-service  product=${REGISTRY}/${REPO_PREFIX}/product_service:${TAG} || true
           kubectl -n "$STAGE_NS" set image deploy/order-service    order=${REGISTRY}/${REPO_PREFIX}/order_service:${TAG} || true
@@ -58,6 +52,3 @@ jobs:
           for d in customer-service product-service order-service frontend; do
             kubectl -n "$STAGE_NS" rollout status deploy/$d --timeout=180s
           done
-
-      - name: Smoke check (basic)
-        run: kubectl -n "$STAGE_NS" get pods,svc,ingress -o wide
