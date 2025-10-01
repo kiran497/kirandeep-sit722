@@ -1,9 +1,10 @@
 name: CD - Stage 2 (Staging)
+
 on:
   workflow_run:
-    workflows: [ "CI - Stage 1 (Testing)" ]
-    types: [ "completed" ]
-    branches: [ "testing" ]
+    workflows: ["CI - Stage 1 (Testing)"]
+    types: [completed]
+    branches: [testing]
   workflow_dispatch:
     inputs:
       image_tag:
@@ -16,7 +17,8 @@ on:
         type: string
 
 env:
-  REGISTRY: ${{ secrets.ACR_LOGIN_SERVER }}
+  REGISTRY:     ${{ secrets.ACR_LOGIN_SERVER }}         # e.g. kiranacr722aue.azurecr.io
+  REPO_PREFIX:  ${{ vars.REPO_PREFIX || 'sit722' }}     # you set 'sit722'
 
 concurrency:
   group: staging-${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || github.run_id }}
@@ -45,23 +47,18 @@ jobs:
           fi
           SHORT="${SHA:0:7}"
 
-          INPUT_TAG="${{ inputs.image_tag || '' }}"
-          if [ -n "$INPUT_TAG" ]; then
-            TAG="$INPUT_TAG"
-          else
-            TAG="testing-latest"
-          fi
+          TAG_INPUT="${{ inputs.image_tag || '' }}"
+          TAG="${TAG_INPUT:-testing-latest}"
 
           NS_SUFFIX="${{ inputs.namespace_suffix || '' }}"
-          if [ -z "$NS_SUFFIX" ]; then
-            NS_SUFFIX="$SHORT"
-          fi
+          NS_SUFFIX="${NS_SUFFIX:-$SHORT}"
           NS="staging-$NS_SUFFIX"
 
           echo "TAG=$TAG"   >> "$GITHUB_OUTPUT"
           echo "NS=$NS"     >> "$GITHUB_OUTPUT"
           echo "REG=${{ env.REGISTRY }}" >> "$GITHUB_OUTPUT"
-          echo "Using REG=${{ env.REGISTRY }}, TAG=$TAG, NS=$NS"
+          echo "PREFIX=${{ env.REPO_PREFIX }}" >> "$GITHUB_OUTPUT"
+          echo "Using REG=${{ env.REGISTRY }}, TAG=$TAG, NS=$NS, PREFIX=${{ env.REPO_PREFIX }}"
 
       - name: Azure Login
         uses: azure/login@v2
@@ -72,18 +69,19 @@ jobs:
         uses: azure/aks-set-context@v4
         with:
           resource-group: ${{ vars.AKS_RESOURCE_GROUP }}
-          cluster-name: ${{ vars.AKS_CLUSTER_NAME }}
+          cluster-name:  ${{ vars.AKS_CLUSTER_NAME }}
 
       - name: Create Staging Namespace
         run: |
           NS="${{ steps.meta.outputs.NS }}"
           kubectl get ns "$NS" >/dev/null 2>&1 || kubectl create ns "$NS"
 
+      # Optional: only needed if AKS is NOT attached to ACR.
       - name: Create ACR imagePullSecret in Namespace
         env:
           REG: ${{ steps.meta.outputs.REG }}
-          NS: ${{ steps.meta.outputs.NS }}
-          SP_APP_ID: ${{ fromJson(secrets.AZURE_CREDENTIALS).clientId }}
+          NS:  ${{ steps.meta.outputs.NS }}
+          SP_APP_ID:  ${{ fromJson(secrets.AZURE_CREDENTIALS).clientId }}
           SP_PASSWORD: ${{ fromJson(secrets.AZURE_CREDENTIALS).clientSecret }}
         run: |
           kubectl -n "$NS" create secret docker-registry acr-cred \
@@ -92,11 +90,6 @@ jobs:
             --docker-password="$SP_PASSWORD" \
             --docker-email="devnull@example.com" \
             --dry-run=client -o yaml | kubectl apply -f -
-
-      - name: Patch ServiceAccount to use imagePullSecret
-        env:
-          NS: ${{ steps.meta.outputs.NS }}
-        run: |
           kubectl -n "$NS" patch serviceaccount default -p '{"imagePullSecrets":[{"name":"acr-cred"}]}' || true
 
       - name: Apply k8s Manifests to Staging
@@ -118,52 +111,45 @@ jobs:
         run: |
           NS="${{ steps.meta.outputs.NS }}"
           REG="${{ steps.meta.outputs.REG }}"
+          PREF="${{ steps.meta.outputs.PREFIX }}"
           TAG="${{ steps.meta.outputs.TAG }}"
-          kubectl -n "$NS" set image deployment/product-service-w10-aks \
-            product-service-container="$REG/product_service:$TAG"
-          kubectl -n "$NS" set image deployment/order-service-w10-aks \
-            order-service-container="$REG/order_service:$TAG"
-          kubectl -n "$NS" set image deployment/customer-service-w10-aks \
-            customer-service-container="$REG/customer_service:$TAG"
-          kubectl -n "$NS" set image deployment/frontend-w10-aks \
-            frontend-container="$REG/frontend:$TAG" || true
+          kubectl -n "$NS" set image deploy/product-service  product="${REG}/${PREF}/product_service:${TAG}"   --record
+          kubectl -n "$NS" set image deploy/order-service    order="${REG}/${PREF}/order_service:${TAG}"       --record
+          kubectl -n "$NS" set image deploy/customer-service customer="${REG}/${PREF}/customer_service:${TAG}" --record
+          kubectl -n "$NS" set image deploy/frontend         frontend="${REG}/${PREF}/frontend:${TAG}"         --record
 
       - name: Wait for Rollouts
         run: |
           NS="${{ steps.meta.outputs.NS }}"
-          kubectl -n "$NS" rollout status deployment/product-service-w10-aks --timeout=600s
-          kubectl -n "$NS" rollout status deployment/order-service-w10-aks --timeout=600s
-          kubectl -n "$NS" rollout status deployment/customer-service-w10-aks --timeout=600s
-          kubectl -n "$NS" rollout status deployment/frontend-w10-aks --timeout=600s || true
+          for d in product-service order-service customer-service frontend; do
+            kubectl -n "$NS" rollout status deploy/$d --timeout=600s
+          done
 
-      - name: Acceptance Checks (/health)
+      - name: Acceptance Checks
         run: |
           set -e
           NS="${{ steps.meta.outputs.NS }}"
-          # Port-forward services and probe /health endpoints
-          kubectl -n "$NS" port-forward svc/product-service-w10-aks 18000:8000 >/dev/null 2>&1 &
-          PFPID1=$!
-          kubectl -n "$NS" port-forward svc/order-service-w10-aks 18001:8000 >/dev/null 2>&1 &
-          PFPID2=$!
-          kubectl -n "$NS" port-forward svc/customer-service-w10-aks 18002:8000 >/dev/null 2>&1 &
-          PFPID3=$!
-          # give port-forwards time to bind
+          kubectl -n "$NS" port-forward svc/product-service 18000:8000 >/dev/null 2>&1 &
+          P1=$!
+          kubectl -n "$NS" port-forward svc/order-service   18001:8000 >/dev/null 2>&1 &
+          P2=$!
+          kubectl -n "$NS" port-forward svc/customer-service 18002:8000 >/dev/null 2>&1 &
+          P3=$!
           sleep 5
           curl -sf http://127.0.0.1:18000/health | cat
           curl -sf http://127.0.0.1:18001/health | cat
           curl -sf http://127.0.0.1:18002/health | cat
-          kubectl -n "$NS" port-forward svc/frontend-w10-aks 18003:80 >/dev/null 2>&1 &
-          PFPID4=$!
+          kubectl -n "$NS" port-forward svc/frontend 18003:80 >/dev/null 2>&1 &
+          P4=$!
           sleep 2
           curl -sf http://127.0.0.1:18003/ | head -n 1 | cat || true
-          # cleanup port-forward background jobs
-          kill $PFPID1 $PFPID2 $PFPID3 $PFPID4 || true
+          kill $P1 $P2 $P3 $P4 || true
 
-      - name: Basic Smoke (Pods Up)
+      - name: Basic Smoke (Pods & Services)
         run: |
           NS="${{ steps.meta.outputs.NS }}"
-          kubectl -n "$NS" get pods
-          kubectl -n "$NS" get svc
+          kubectl -n "$NS" get pods -o wide
+          kubectl -n "$NS" get svc  -o wide
 
       - name: Destroy Staging Environment
         if: always()
