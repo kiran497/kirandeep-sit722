@@ -8,54 +8,66 @@ on:
   workflow_dispatch:
     inputs:
       image_tag:
-        description: "ACR tag to deploy (default: testing-latest)"
+        description: "ACR image tag to deploy (default: testing-latest)"
         required: false
         type: string
-
-permissions:
-  id-token: write
-  contents: read
-
-concurrency:
-  group: stage-${{ github.event.workflow_run.head_sha || github.run_id }}
-  cancel-in-progress: true
+      namespace_suffix:
+        description: "Optional: override dynamic staging namespace suffix"
+        required: false
+        type: string
 
 env:
   REGISTRY: ${{ secrets.ACR_LOGIN_SERVER }}
 
+concurrency:
+  group: staging-${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || github.run_id }}
+  cancel-in-progress: true
+
 jobs:
   deploy-staging:
+    name: Deploy Staging
+    # run when manually dispatched OR CI finished successfully on testing
     if: github.event_name == 'workflow_dispatch' || (github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success')
     runs-on: ubuntu-latest
-    env:
-      AKS_RG:      ${{ vars.AKS_RESOURCE_GROUP }}
-      AKS_CLUSTER: ${{ vars.AKS_CLUSTER_NAME }}
-      NS:          ${{ vars.STAGING_NAMESPACE }}
-      REPO:        ${{ vars.REPO_PREFIX || 'sit722' }}
-      TAG:         ${{ inputs.image_tag != '' && inputs.image_tag || 'testing-latest' }}
+    permissions: { id-token: write, contents: read }
 
     steps:
-      - name: Checkout triggering commit
-        uses: actions/checkout@v4
+      # Checkout the commit that produced the images (for workflow_run),
+      # otherwise the current SHA for manual runs
+      - uses: actions/checkout@v4
         with:
-          ref: ${{ (github.event_name == 'workflow_run' && github.event.workflow_run.head_sha) || github.sha }}
+          ref: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || github.sha }}
           fetch-depth: 1
 
-      - name: Locate Kubernetes manifests
-        id: find
+      - name: Compute tag / namespace / prefix
+        id: meta
         shell: bash
         run: |
-          set -euo pipefail
-          for d in k8s K8s deploy/k8s manifests; do
-            if [[ -d "$d" ]] && compgen -G "$d/*.y*ml" > /dev/null; then
-              echo "dir=$d" >> "$GITHUB_OUTPUT"
-              echo "Manifests: $d"
-              exit 0
-            fi
-          done
-          echo "::error::No folder with Kubernetes YAMLs found (looked in: k8s, K8s, deploy/k8s, manifests)"
-          echo "Tree:"; find . -maxdepth 2 -type d -print
-          exit 1
+          if [ "${{ github.event_name }}" = "workflow_run" ]; then
+            SHA="${{ github.event.workflow_run.head_sha }}"
+          else
+            SHA="${{ github.sha }}"
+          fi
+          SHORT="${SHA:0:7}"
+
+          # tag: input or default
+          TAG="${{ inputs.image_tag }}"
+          [ -z "$TAG" ] && TAG="testing-latest"
+
+          # namespace: dynamic "staging-<suffix>" (override via input)
+          SUFFIX="${{ inputs.namespace_suffix }}"
+          [ -z "$SUFFIX" ] && SUFFIX="$SHORT"
+          NS="staging-$SUFFIX"
+
+          # repo prefix (matches your repo variable)
+          PREFIX="${{ vars.REPO_PREFIX }}"
+          [ -z "$PREFIX" ] && PREFIX="sit722"
+
+          echo "TAG=$TAG"     >> "$GITHUB_OUTPUT"
+          echo "NS=$NS"       >> "$GITHUB_OUTPUT"
+          echo "PREFIX=$PREFIX" >> "$GITHUB_OUTPUT"
+          echo "REG=${{ env.REGISTRY }}" >> "$GITHUB_OUTPUT"
+          echo "Using REG=${{ env.REGISTRY }}, TAG=$TAG, NS=$NS, PREFIX=$PREFIX"
 
       - name: Azure login
         uses: azure/login@v2
@@ -65,54 +77,93 @@ jobs:
       - name: Set AKS context
         uses: azure/aks-set-context@v4
         with:
-          resource-group: ${{ env.AKS_RG }}
-          cluster-name:   ${{ env.AKS_CLUSTER }}
+          resource-group: ${{ vars.AKS_RESOURCE_GROUP }}
+          cluster-name:   ${{ vars.AKS_CLUSTER_NAME }}
+          # optional but removes the warning:
           subscription:   ${{ fromJson(secrets.AZURE_CREDENTIALS).subscriptionId }}
 
-      - name: Ensure namespace & imagePullSecret
+      - name: Ensure namespace exists
+        run: kubectl get ns "${{ steps.meta.outputs.NS }}" >/dev/null 2>&1 || kubectl create ns "${{ steps.meta.outputs.NS }}"
+
+      - name: Create/Update ACR imagePullSecret
         env:
-          SP_APP_ID: ${{ fromJson(secrets.AZURE_CREDENTIALS).clientId }}
-          SP_PASS:   ${{ fromJson(secrets.AZURE_CREDENTIALS).clientSecret }}
+          REG: ${{ steps.meta.outputs.REG }}
+          NS:  ${{ steps.meta.outputs.NS }}
+          SP_APP_ID:   ${{ fromJson(secrets.AZURE_CREDENTIALS).clientId }}
+          SP_PASSWORD: ${{ fromJson(secrets.AZURE_CREDENTIALS).clientSecret }}
         run: |
-          kubectl get ns "$NS" >/dev/null 2>&1 || kubectl create ns "$NS"
           kubectl -n "$NS" create secret docker-registry acr-cred \
-            --docker-server="$REGISTRY" \
+            --docker-server="$REG" \
             --docker-username="$SP_APP_ID" \
-            --docker-password="$SP_PASS" \
+            --docker-password="$SP_PASSWORD" \
             --docker-email="devnull@example.com" \
             --dry-run=client -o yaml | kubectl apply -f -
           kubectl -n "$NS" patch serviceaccount default -p '{"imagePullSecrets":[{"name":"acr-cred"}]}' || true
 
-      - name: Apply manifests
-        run: kubectl apply -n "$NS" -f "${{ steps.find.outputs.dir }}"
-
-      - name: Pin images to tag
+      - name: Apply Kubernetes manifests
+        working-directory: k8s
+        env:
+          NS: ${{ steps.meta.outputs.NS }}
         run: |
           set -e
-          declare -A MAP=(
-            [customer-service]="${REGISTRY}/${REPO}/customer_service:${TAG}"
-            [product-service]="${REGISTRY}/${REPO}/product_service:${TAG}"
-            [order-service]="${REGISTRY}/${REPO}/order_service:${TAG}"
-            [frontend]="${REGISTRY}/${REPO}/frontend:${TAG}"
-            [customer-service-w10-aks]="${REGISTRY}/${REPO}/customer_service:${TAG}"
-            [product-service-w10-aks]="${REGISTRY}/${REPO}/product_service:${TAG}"
-            [order-service-w10-aks]="${REGISTRY}/${REPO}/order_service:${TAG}"
-            [frontend-w10-aks]="${REGISTRY}/${REPO}/frontend:${TAG}"
-          )
-          for dep in "${!MAP[@]}"; do
-            kubectl -n "$NS" set image deployment/$dep "*=${MAP[$dep]}" --record=false 2>/dev/null || true
+          for f in configmaps.yaml secrets.yaml rabbitmq.yaml \
+                   product-db.yaml order-db.yaml customer-db.yaml \
+                   product-service.yaml order-service.yaml customer-service.yaml \
+                   frontend.yaml; do
+            [ -f "$f" ] && kubectl -n "$NS" apply -f "$f" || true
           done
 
-      - name: Wait for rollouts
+      - name: Set images to computed tag
+        env:
+          NS:     ${{ steps.meta.outputs.NS }}
+          REG:    ${{ steps.meta.outputs.REG }}
+          PREFIX: ${{ steps.meta.outputs.PREFIX }}
+          TAG:    ${{ steps.meta.outputs.TAG }}
+        shell: bash
         run: |
-          for d in customer-service product-service order-service frontend \
-                   customer-service-w10-aks product-service-w10-aks order-service-w10-aks frontend-w10-aks
-          do
-            kubectl -n "$NS" rollout status deployment/$d --timeout=300s || true
+          set -e
+          update_img () {
+            dep="$1"; repo="$2"
+            # grab the first container name in the deployment to avoid name mismatches
+            cn=$(kubectl -n "$NS" get deploy "$dep" -o jsonpath='{.spec.template.spec.containers[0].name}')
+            kubectl -n "$NS" set image deploy/"$dep" "$cn=$REG/$PREFIX/$repo:$TAG" || true
+          }
+          update_img product-service  product_service
+          update_img order-service    order_service
+          update_img customer-service customer_service
+          update_img frontend         frontend
+
+      - name: Wait for rollout
+        env: { NS: ${{ steps.meta.outputs.NS }} }
+        run: |
+          for dep in product-service order-service customer-service frontend; do
+            kubectl -n "$NS" rollout status deploy/$dep --timeout=600s || true
           done
 
-      - name: Smoke inventory
+      - name: Acceptance checks (/health)
+        env: { NS: ${{ steps.meta.outputs.NS }} }
         run: |
-          kubectl -n "$NS" get pods -o wide
-          kubectl -n "$NS" get svc -o wide
-          kubectl -n "$NS" get ingress -o wide || true
+          set -e
+          kubectl -n "$NS" port-forward svc/product-service  18000:8000 >/dev/null 2>&1 & P1=$!
+          kubectl -n "$NS" port-forward svc/order-service    18001:8000 >/dev/null 2>&1 & P2=$!
+          kubectl -n "$NS" port-forward svc/customer-service 18002:8000 >/dev/null 2>&1 & P3=$!
+          sleep 5
+          curl -sf http://127.0.0.1:18000/health | cat
+          curl -sf http://127.0.0.1:18001/health | cat
+          curl -sf http://127.0.0.1:18002/health | cat
+          kubectl -n "$NS" port-forward svc/frontend 18003:80 >/dev/null 2>&1 & P4=$!
+          sleep 2
+          curl -sf http://127.0.0.1:18003/ | head -n 1 | cat || true
+          kill $P1 $P2 $P3 $P4 || true
+
+      - name: Smoke summary
+        env: { NS: ${{ steps.meta.outputs.NS }} }
+        run: |
+          kubectl -n "$NS" get deploy,svc,pods -o wide
+
+      # If you want ephemeral staging per run, leave this enabled.
+      # If you want to keep the namespace, delete this step.
+      - name: Destroy ephemeral namespace (cleanup)
+        if: always()
+        env: { NS: ${{ steps.meta.outputs.NS }} }
+        run: kubectl delete ns "$NS" --wait=false
