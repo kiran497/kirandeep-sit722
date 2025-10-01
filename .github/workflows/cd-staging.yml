@@ -11,10 +11,6 @@ on:
         description: "ACR image tag to deploy (default: testing-latest)"
         required: false
         type: string
-      namespace_suffix:
-        description: "Not used here (kept for parity)"
-        required: false
-        type: string
 
 permissions:
   id-token: write
@@ -29,42 +25,58 @@ env:
 
 jobs:
   deploy-staging:
-    name: Deploy Staging
     if: github.event_name == 'workflow_dispatch' || (github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success')
     runs-on: ubuntu-latest
-
     env:
-      AKS_RG:         ${{ vars.AKS_RESOURCE_GROUP }}     # e.g. rg-sit722-kiran
-      AKS_CLUSTER:    ${{ vars.AKS_CLUSTER_NAME }}       # e.g. kiranaks722
-      STAGE_NS:       ${{ vars.STAGING_NAMESPACE }}      # e.g. staging-sit722-kiran
-      REPO_PREFIX:    ${{ vars.REPO_PREFIX || 'sit722' }}
-      TAG:            ${{ inputs.image_tag || 'testing-latest' }}
+      AKS_RG:        ${{ vars.AKS_RESOURCE_GROUP }}
+      AKS_CLUSTER:   ${{ vars.AKS_CLUSTER_NAME }}
+      STAGE_NS:      ${{ vars.STAGING_NAMESPACE }}
+      REPO_PREFIX:   ${{ vars.REPO_PREFIX || 'sit722' }}
+      TAG:           ${{ inputs.image_tag || 'testing-latest' }}
 
     steps:
-      # ✅ checkout the exact commit that triggered CI (so k8s/ exists)
+      # Always deploy the exact commit that produced the images
       - name: Checkout triggering commit
         uses: actions/checkout@v4
         with:
           ref: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || github.sha }}
           fetch-depth: 1
 
-      - name: Show repo tree
+      # Find your manifests folder robustly
+      - name: Locate k8s manifests
+        id: find
+        shell: bash
         run: |
-          pwd
+          set -e
+          echo "Repo root: $(pwd)"
+          echo "Top-level:"
           ls -la
-          test -d k8s && ls -la k8s || { echo "::error::k8s directory missing in this ref"; exit 1; }
 
-      - name: Sanity check variables
-        run: |
-          echo "AKS_RG=${AKS_RG}"
-          echo "AKS_CLUSTER=${AKS_CLUSTER}"
-          echo "STAGE_NS=${STAGE_NS}"
-          echo "REGISTRY=${REGISTRY}"
-          echo "REPO_PREFIX=${REPO_PREFIX}"
-          echo "TAG=${TAG}"
-          test -n "${AKS_RG}"      || { echo "::error::AKS_RG empty"; exit 1; }
-          test -n "${AKS_CLUSTER}" || { echo "::error::AKS_CLUSTER empty"; exit 1; }
-          test -n "${STAGE_NS}"    || { echo "::error::STAGE_NS empty"; exit 1; }
+          # candidates: change/add more if yours differ
+          CANDIDATES=(
+            "./k8s"
+            "./K8s"
+            "./deploy/k8s"
+            "./manifests"
+          )
+
+          PICK=""
+          for d in "${CANDIDATES[@]}"; do
+            if [ -d "$d" ] && ls "$d"/*.yaml >/dev/null 2>&1; then
+              PICK="$d"
+              break
+            fi
+          done
+
+          if [ -z "$PICK" ]; then
+            echo "::error::Couldn't find a k8s manifests folder (looked in: ${CANDIDATES[*]})"
+            echo "Tree for debugging:"; find . -maxdepth 2 -type d -print
+            exit 1
+          fi
+
+          echo "K8S_DIR=$PICK" >> "$GITHUB_OUTPUT"
+          echo "Manifests folder: $PICK"
+          ls -la "$PICK"
 
       - name: Azure login
         uses: azure/login@v2
@@ -74,10 +86,9 @@ jobs:
       - name: Set AKS context
         uses: azure/aks-set-context@v4
         with:
-          resource-group:  ${{ env.AKS_RG }}
-          cluster-name:    ${{ env.AKS_CLUSTER }}
-          # correct input name is 'subscription'
-          subscription:    ${{ fromJson(secrets.AZURE_CREDENTIALS).subscriptionId }}
+          resource-group: ${{ env.AKS_RG }}
+          cluster-name:   ${{ env.AKS_CLUSTER }}
+          subscription:   ${{ fromJson(secrets.AZURE_CREDENTIALS).subscriptionId }}  # correct input key
 
       - name: Ensure namespace exists
         run: kubectl get ns "$STAGE_NS" >/dev/null 2>&1 || kubectl create ns "$STAGE_NS"
@@ -96,8 +107,7 @@ jobs:
           kubectl -n "$STAGE_NS" patch serviceaccount default -p '{"imagePullSecrets":[{"name":"acr-cred"}]}' || true
 
       - name: Apply Kubernetes manifests
-        working-directory: k8s
-        run: kubectl apply -n "$STAGE_NS" -f .
+        run: kubectl apply -n "$STAGE_NS" -f "${{ steps.find.outputs.K8S_DIR }}"
 
       - name: Set images to ${TAG}
         run: |
