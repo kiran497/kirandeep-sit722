@@ -1,0 +1,65 @@
+name: CD (production) - AKS prod namespace
+
+on:
+  push:
+    branches: [ main ]
+
+env:
+  ACR_NAME: ${{ secrets.ACR_NAME }}                 # kiranacr722
+  ACR_LOGIN_SERVER: ${{ secrets.ACR_LOGIN_SERVER }} # e.g. kiranacr722.azurecr.io
+  AKS_RG: ${{ vars.AKS_RESOURCE_GROUP }}            # rg-sit722-kiran
+  AKS_CLUSTER: ${{ vars.AKS_CLUSTER_NAME }}         # kiranaks722
+  PROD_NS: ${{ vars.PROD_NAMESPACE }}               # prod-sit722-kiran
+
+jobs:
+  build_main_images:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/login@v2
+        with: { creds: ${{ secrets.AZURE_CREDENTIALS }} }
+      - name: Login to ACR
+        run: az acr login --name $ACR_NAME
+      - name: Build & push backends (main-latest)
+        run: |
+          for svc in customer_service product_service order_service; do
+            docker build -t ${ACR_LOGIN_SERVER}/sit722/$svc:main-latest ./backend/$svc
+            docker push ${ACR_LOGIN_SERVER}/sit722/$svc:main-latest
+          done
+      - name: Build & push frontend (main-latest)
+        run: |
+          docker build -t ${ACR_LOGIN_SERVER}/sit722/frontend:main-latest ./frontend
+          docker push ${ACR_LOGIN_SERVER}/sit722/frontend:main-latest
+
+  deploy_prod:
+    needs: build_main_images
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/login@v2
+        with: { creds: ${{ secrets.AZURE_CREDENTIALS }} }
+      - name: Set AKS context
+        uses: azure/aks-set-context@v4
+        with:
+          resource-group: ${{ env.AKS_RG }}
+          cluster-name:  ${{ env.AKS_CLUSTER }}
+
+      - name: Ensure prod namespace exists
+        run: kubectl get ns $PROD_NS || kubectl create ns $PROD_NS
+
+      - name: Apply base manifests to prod
+        run: kubectl -n $PROD_NS apply -f k8s/
+
+      - name: Pin images to main-latest
+        run: |
+          kubectl -n $PROD_NS set image deployment/customer-service customer-service=${{ env.ACR_LOGIN_SERVER }}/sit722/customer_service:main-latest
+          kubectl -n $PROD_NS set image deployment/product-service  product-service=${{ env.ACR_LOGIN_SERVER }}/sit722/product_service:main-latest
+          kubectl -n $PROD_NS set image deployment/order-service    order-service=${{ env.ACR_LOGIN_SERVER }}/sit722/order_service:main-latest
+          kubectl -n $PROD_NS set image deployment/frontend         frontend=${{ env.ACR_LOGIN_SERVER }}/sit722/frontend:main-latest
+
+      - name: Wait for rollouts
+        run: |
+          kubectl -n $PROD_NS rollout status deployment/customer-service --timeout=180s
+          kubectl -n $PROD_NS rollout status deployment/product-service  --timeout=180s
+          kubectl -n $PROD_NS rollout status deployment/order-service    --timeout=180s
+          kubectl -n $PROD_NS rollout status deployment/frontend         --timeout=180s

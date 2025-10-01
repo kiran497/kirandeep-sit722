@@ -1,0 +1,84 @@
+name: CI (testing) - tests → ACR push
+
+on:
+  push:
+    branches: [ testing ]
+
+env:
+  ACR_NAME: ${{ secrets.ACR_NAME }}                          # kiranacr722
+  ACR_LOGIN_SERVER: ${{ secrets.ACR_LOGIN_SERVER }}          # e.g. kiranacr722.azurecr.io
+
+jobs:
+  test_backends:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:14
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: postgres
+        ports: [ "5432:5432" ]
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    strategy:
+      matrix:
+        svc: [customer_service, product_service, order_service]
+        include:
+          - svc: customer_service
+            path: backend/customer_service
+          - svc: product_service
+            path: backend/product_service
+          - svc: order_service
+            path: backend/order_service
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.11" }
+
+      - name: Install dev deps
+        working-directory: ${{ matrix.path }}
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt
+
+      - name: Run pytest
+        working-directory: ${{ matrix.path }}
+        env:
+          POSTGRES_HOST: localhost
+          POSTGRES_PORT: "5432"
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: postgres
+        run: pytest -q
+
+  build_push_images:
+    needs: test_backends
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/login@v2
+        with: { creds: ${{ secrets.AZURE_CREDENTIALS }} }
+
+      - name: Login to ACR
+        run: az acr login --name $ACR_NAME
+
+      - name: Build & push backend images (sha + testing-latest)
+        run: |
+          for svc in customer_service product_service order_service; do
+            docker build -t ${ACR_LOGIN_SERVER}/sit722/$svc:${{ github.sha }} ./backend/$svc
+            docker tag ${ACR_LOGIN_SERVER}/sit722/$svc:${{ github.sha }} ${ACR_LOGIN_SERVER}/sit722/$svc:testing-latest
+            docker push ${ACR_LOGIN_SERVER}/sit722/$svc:${{ github.sha }}
+            docker push ${ACR_LOGIN_SERVER}/sit722/$svc:testing-latest
+          done
+
+      - name: Build & push frontend image (sha + testing-latest)
+        run: |
+          docker build -t ${ACR_LOGIN_SERVER}/sit722/frontend:${{ github.sha }} ./frontend
+          docker tag ${ACR_LOGIN_SERVER}/sit722/frontend:${{ github.sha }} ${ACR_LOGIN_SERVER}/sit722/frontend:testing-latest
+          docker push ${ACR_LOGIN_SERVER}/sit722/frontend:${{ github.sha }}
+          docker push ${ACR_LOGIN_SERVER}/sit722/frontend:testing-latest
