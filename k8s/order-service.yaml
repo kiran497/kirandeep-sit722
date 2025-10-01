@@ -26,6 +26,9 @@ spec:
         - name: wait-for-db
           image: busybox:1.36
           command: ['sh','-c','until nc -z order-db 5432; do echo "waiting for order-db"; sleep 2; done']
+        - name: wait-for-rabbitmq
+          image: busybox:1.36
+          command: ['sh','-c','until nc -z rabbitmq 5672; do echo "waiting for rabbitmq"; sleep 2; done']
       containers:
         - name: order
           image: kiranacr722.azurecr.io/sit722/order_service:testing-latest
@@ -36,6 +39,7 @@ spec:
             periodSeconds: 5
             failureThreshold: 12
           env:
+            # Postgres
             - { name: POSTGRES_HOST, value: order-db }
             - { name: POSTGRES_PORT, value: "5432" }
             - { name: POSTGRES_DB,   value: orders }
@@ -43,3 +47,6 @@ spec:
               valueFrom: { secretKeyRef: { name: ecomm-secrets, key: POSTGRES_USER } }
             - name: POSTGRES_PASSWORD
               valueFrom: { secretKeyRef: { name: ecomm-secrets, key: POSTGRES_PASSWORD } }
+            # RabbitMQ (FIXED)
+            - { name: RABBITMQ_HOST, value: rabbitmq }
+            - { name: RABBITMQ_PORT, value: "5672" }
