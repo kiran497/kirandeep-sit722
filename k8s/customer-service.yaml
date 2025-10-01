@@ -1,8 +1,22 @@
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: customer-service
+spec:
+  selector:
+    app: customer-service
+  ports:
+    - port: 8000
+      targetPort: 8000
+---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: customer-service
 spec:
+  strategy:
+    type: Recreate
   replicas: 1
   selector:
     matchLabels:
@@ -14,7 +28,9 @@ spec:
     spec:
       imagePullSecrets:
         - name: acr-cred
-      initContainers:                             
+      terminationGracePeriodSeconds: 10
+      # Wait for Postgres before starting the app
+      initContainers:
         - name: wait-for-db
           image: busybox:1.36
           command: ['sh','-c','until nc -z customer-db 5432; do echo "waiting for customer-db"; sleep 2; done']
@@ -23,9 +39,9 @@ spec:
           image: kiranacr722.azurecr.io/sit722/customer_service:testing-latest
           ports:
             - containerPort: 8000
-          readinessProbe:                         
+          readinessProbe:
             httpGet:
-              path: /
+              path: /          # change if your service health path differs
               port: 8000
             initialDelaySeconds: 5
             periodSeconds: 5
@@ -38,6 +54,12 @@ spec:
             - name: POSTGRES_DB
               value: customers
             - name: POSTGRES_USER
-              valueFrom: { secretKeyRef: { name: ecomm-secrets, key: POSTGRES_USER } }
+              valueFrom:
+                secretKeyRef:
+                  name: ecomm-secrets
+                  key: POSTGRES_USER
             - name: POSTGRES_PASSWORD
-              valueFrom: { secretKeyRef: { name: ecomm-secrets, key: POSTGRES_PASSWORD } }
+              valueFrom:
+                secretKeyRef:
+                  name: ecomm-secrets
+                  key: POSTGRES_PASSWORD

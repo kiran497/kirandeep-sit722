@@ -4,7 +4,7 @@ metadata:
   name: product-service
 spec:
   strategy:
-    type: Recreate                  
+    type: Recreate
   replicas: 1
   selector:
     matchLabels: { app: product-service }
@@ -24,7 +24,7 @@ spec:
           image: kiranacr722.azurecr.io/sit722/product_service:testing-latest
           ports: [{ containerPort: 8000 }]
           readinessProbe:
-            httpGet: { path: /, port: 8000 }
+            httpGet: { path: /, port: 8000 }   # change path if your service root isn’t /
             initialDelaySeconds: 5
             periodSeconds: 5
             failureThreshold: 12
