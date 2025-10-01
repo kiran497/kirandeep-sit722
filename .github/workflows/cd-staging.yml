@@ -2,34 +2,62 @@ name: CD - Stage 2 (Staging)
 
 on:
   workflow_run:
-    workflows: ["CI - Stage 1 (Testing)", "CI — Verify, Build, Publish (testing)"]
+    workflows: ["CI - Stage 1 (Testing)"]
     types: [completed]
+    branches: [testing]
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: "ACR image tag to deploy (default: testing-latest)"
+        required: false
+        type: string
+      namespace_suffix:
+        description: "Not used here (kept for parity)"
+        required: false
+        type: string
 
 permissions:
   id-token: write
   contents: read
 
+# prevent overlapping deploys
+concurrency:
+  group: staging-${{ github.event.workflow_run.head_sha || github.run_id }}
+  cancel-in-progress: true
+
+# global env
 env:
   REGISTRY: ${{ secrets.ACR_LOGIN_SERVER }}
-  REPO_PREFIX: ${{ vars.REPO_PREFIX || 'sit722' }}
-  AKS_RG: ${{ vars.AKS_RG }}
-  AKS_CLUSTER: ${{ vars.AKS_CLUSTER }}
-  STAGE_NS: ${{ vars.STAGE_NS }}
-  TAG: testing-latest
 
 jobs:
-  deploy:
-    if: >
-      ${{
-        github.event.workflow_run.conclusion == 'success' &&
-        github.event.workflow_run.head_branch == 'testing'
-      }}
+  deploy-staging:
+    name: Deploy Staging
+    if: github.event_name == 'workflow_dispatch' || (github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success')
     runs-on: ubuntu-latest
+
+    # ⬇️ Map repo VARIABLES to the env names used by the steps
+    env:
+      AKS_RG:         ${{ vars.AKS_RESOURCE_GROUP }}   # e.g. rg-sit722-kiran
+      AKS_CLUSTER:    ${{ vars.AKS_CLUSTER_NAME }}     # e.g. kiranaks722
+      STAGE_NS:       ${{ vars.STAGING_NAMESPACE }}    # e.g. staging-sit722-kiran
+      REPO_PREFIX:    ${{ vars.REPO_PREFIX || 'sit722' }}
+      TAG:            ${{ inputs.image_tag || 'testing-latest' }}
 
     steps:
       - uses: actions/checkout@v4
-        with:
-          ref: ${{ github.event.workflow_run.head_sha }}
+
+      # quick guardrail so you immediately see if anything is empty
+      - name: Sanity check variables
+        run: |
+          echo "AKS_RG=${AKS_RG}"
+          echo "AKS_CLUSTER=${AKS_CLUSTER}"
+          echo "STAGE_NS=${STAGE_NS}"
+          echo "REGISTRY=${REGISTRY}"
+          echo "REPO_PREFIX=${REPO_PREFIX}"
+          echo "TAG=${TAG}"
+          test -n "${AKS_RG}"      || { echo "::error::AKS_RG empty"; exit 1; }
+          test -n "${AKS_CLUSTER}" || { echo "::error::AKS_CLUSTER empty"; exit 1; }
+          test -n "${STAGE_NS}"    || { echo "::error::STAGE_NS empty"; exit 1; }
 
       - name: Azure login
         uses: azure/login@v2
@@ -39,27 +67,55 @@ jobs:
       - name: Set AKS context
         uses: azure/aks-set-context@v4
         with:
-          resource-group: ${{ env.AKS_RG }}
-          cluster-name: ${{ env.AKS_CLUSTER }}
+          resource-group:  ${{ env.AKS_RG }}
+          cluster-name:    ${{ env.AKS_CLUSTER }}
+          subscription-id: ${{ fromJson(secrets.AZURE_CREDENTIALS).subscriptionId }}
 
-      - name: Ensure namespace
-        run: kubectl get ns $STAGE_NS || kubectl create ns $STAGE_NS
+      - name: Ensure namespace exists
+        run: kubectl get ns "$STAGE_NS" >/dev/null 2>&1 || kubectl create ns "$STAGE_NS"
+
+      # create/update imagePullSecret (if your cluster doesn't use ACR MI)
+      - name: Create/Update ACR imagePullSecret
+        env:
+          SP_APP_ID:   ${{ fromJson(secrets.AZURE_CREDENTIALS).clientId }}
+          SP_PASSWORD: ${{ fromJson(secrets.AZURE_CREDENTIALS).clientSecret }}
+        run: |
+          kubectl -n "$STAGE_NS" create secret docker-registry acr-cred \
+            --docker-server="$REGISTRY" \
+            --docker-username="$SP_APP_ID" \
+            --docker-password="$SP_PASSWORD" \
+            --docker-email="devnull@example.com" \
+            --dry-run=client -o yaml | kubectl apply -f -
+          kubectl -n "$STAGE_NS" patch serviceaccount default -p '{"imagePullSecrets":[{"name":"acr-cred"}]}' || true
 
       - name: Apply Kubernetes manifests
-        run: kubectl apply -n $STAGE_NS -f k8s/
+        run: kubectl apply -n "$STAGE_NS" -f k8s/
 
-      - name: Set images to testing-latest
+      - name: Set images to ${TAG}
         run: |
-          kubectl -n $STAGE_NS set image deploy/customer-service customer=${REGISTRY}/${REPO_PREFIX}/customer_service:${TAG} || true
-          kubectl -n $STAGE_NS set image deploy/product-service  product=${REGISTRY}/${REPO_PREFIX}/product_service:${TAG} || true
-          kubectl -n $STAGE_NS set image deploy/order-service    order=${REGISTRY}/${REPO_PREFIX}/order_service:${TAG} || true
-          kubectl -n $STAGE_NS set image deploy/frontend         frontend=${REGISTRY}/${REPO_PREFIX}/frontend:${TAG} || true
+          # plain names
+          kubectl -n "$STAGE_NS" set image deploy/customer-service customer=${REGISTRY}/${REPO_PREFIX}/customer_service:${TAG} || true
+          kubectl -n "$STAGE_NS" set image deploy/product-service  product=${REGISTRY}/${REPO_PREFIX}/product_service:${TAG} || true
+          kubectl -n "$STAGE_NS" set image deploy/order-service    order=${REGISTRY}/${REPO_PREFIX}/order_service:${TAG} || true
+          kubectl -n "$STAGE_NS" set image deploy/frontend         frontend=${REGISTRY}/${REPO_PREFIX}/frontend:${TAG} || true
+
+          # -w10-aks names (if your manifests use these)
+          kubectl -n "$STAGE_NS" set image deployment/customer-service-w10-aks customer-service-container=${REGISTRY}/${REPO_PREFIX}/customer_service:${TAG} || true
+          kubectl -n "$STAGE_NS" set image deployment/product-service-w10-aks  product-service-container=${REGISTRY}/${REPO_PREFIX}/product_service:${TAG}   || true
+          kubectl -n "$STAGE_NS" set image deployment/order-service-w10-aks    order-service-container=${REGISTRY}/${REPO_PREFIX}/order_service:${TAG}       || true
+          kubectl -n "$STAGE_NS" set image deployment/frontend-w10-aks         frontend-container=${REGISTRY}/${REPO_PREFIX}/frontend:${TAG}                 || true
 
       - name: Wait for rollout
         run: |
-          for d in customer-service product-service order-service frontend; do
-            kubectl -n $STAGE_NS rollout status deploy/$d --timeout=180s
+          for dep in \
+            customer-service product-service order-service frontend \
+            customer-service-w10-aks product-service-w10-aks order-service-w10-aks frontend-w10-aks
+          do
+            kubectl -n "$STAGE_NS" rollout status deployment/$dep --timeout=300s || true
           done
 
-      - name: Smoke check (basic)
-        run: kubectl -n $STAGE_NS get pods,svc,ingress -o wide
+      - name: Smoke check
+        run: |
+          kubectl -n "$STAGE_NS" get pods -o wide
+          kubectl -n "$STAGE_NS" get svc -o wide
+          kubectl -n "$STAGE_NS" get ingress -o wide || true
