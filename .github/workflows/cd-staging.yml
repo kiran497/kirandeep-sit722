@@ -1,0 +1,143 @@
+name: CD - Stage 2 (Staging)
+
+on:
+  workflow_run:
+    workflows: ["CI - Stage 1 (Testing)"]
+    types: [completed]
+    branches: [testing]
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: "ACR image tag to deploy (default: testing-latest)"
+        required: false
+        type: string
+
+permissions:
+  id-token: write
+  contents: read
+
+concurrency:
+  group: staging-${{ github.event.workflow_run.head_sha || github.run_id }}
+  cancel-in-progress: true
+
+env:
+  REGISTRY: ${{ secrets.ACR_LOGIN_SERVER }}
+
+jobs:
+  deploy-staging:
+    if: github.event_name == 'workflow_dispatch' || (github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success')
+    runs-on: ubuntu-latest
+
+    env:
+      AKS_RG:        ${{ vars.AKS_RESOURCE_GROUP }}
+      AKS_CLUSTER:   ${{ vars.AKS_CLUSTER_NAME }}
+      STAGE_NS:      ${{ vars.STAGING_NAMESPACE }}
+      REPO_PREFIX:   ${{ vars.REPO_PREFIX || 'sit722' }}
+      TAG:           ${{ inputs.image_tag || 'testing-latest' }}
+
+    steps:
+      - name: Checkout triggering commit
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || github.sha }}
+          fetch-depth: 1
+
+      - name: Locate k8s manifests folder
+        id: find
+        shell: bash
+        run: |
+          set -e
+          echo "Repo root: $(pwd)"
+          echo "Top-level:"
+          ls -la
+
+          # candidates to probe
+          CANDIDATES=( "./k8s" "./K8s" "./deploy/k8s" "./manifests" )
+
+          PICK=""
+          for d in "${CANDIDATES[@]}"; do
+            if [ -d "$d" ] && ls "$d"/*.yaml >/dev/null 2>&1; then
+              PICK="$d"
+              break
+            fi
+          done
+
+          if [ -z "$PICK" ]; then
+            echo "::error::Couldn't find a k8s manifests folder (looked in: ${CANDIDATES[*]})"
+            echo "Tree for debugging:"; find . -maxdepth 2 -type d -print
+            exit 1
+          fi
+
+          echo "K8S_DIR=$PICK" >> "$GITHUB_OUTPUT"
+          echo "Manifests folder: $PICK"
+          ls -la "$PICK"
+
+      - name: Azure login (SP JSON)
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Set AKS context
+        uses: azure/aks-set-context@v4
+        with:
+          resource-group: ${{ env.AKS_RG }}
+          cluster-name:   ${{ env.AKS_CLUSTER }}
+          subscription:   ${{ fromJson(secrets.AZURE_CREDENTIALS).subscriptionId }}
+
+      - name: Ensure namespace exists
+        run: kubectl get ns "$STAGE_NS" >/dev/null 2>&1 || kubectl create ns "$STAGE_NS"
+
+      - name: Create / Update ACR imagePullSecret
+        env:
+          SP_APP_ID:   ${{ fromJson(secrets.AZURE_CREDENTIALS).clientId }}
+          SP_PASSWORD: ${{ fromJson(secrets.AZURE_CREDENTIALS).clientSecret }}
+        run: |
+          kubectl -n "$STAGE_NS" create secret docker-registry acr-cred \
+            --docker-server="$REGISTRY" \
+            --docker-username="$SP_APP_ID" \
+            --docker-password="$SP_PASSWORD" \
+            --docker-email="devnull@example.com" \
+            --dry-run=client -o yaml | kubectl apply -f -
+          kubectl -n "$STAGE_NS" patch serviceaccount default -p '{"imagePullSecrets":[{"name":"acr-cred"}]}' || true
+
+      - name: Patch YAMLs for target namespace (strip any hard-coded `namespace:`)
+        shell: bash
+        run: |
+          set -e
+          KDIR="${{ steps.find.outputs.K8S_DIR }}"
+          # Remove any existing "namespace:" lines to avoid conflicts
+          find "$KDIR" -name "*.yaml" -print -exec sed -i -E 's/^[[:space:]]*namespace:.*$//' {} +
+          echo "Patched YAMLs in $KDIR"
+
+      - name: Apply Kubernetes manifests (staging)
+        run: |
+          kubectl apply -n "$STAGE_NS" -f "${{ steps.find.outputs.K8S_DIR }}"
+
+      - name: Set images to ${{ env.TAG }}
+        run: |
+          # generic names (if your files create these)
+          kubectl -n "$STAGE_NS" set image deploy/customer-service customer=${REGISTRY}/${REPO_PREFIX}/customer_service:${TAG} || true
+          kubectl -n "$STAGE_NS" set image deploy/product-service  product=${REGISTRY}/${REPO_PREFIX}/product_service:${TAG} || true
+          kubectl -n "$STAGE_NS" set image deploy/order-service    order=${REGISTRY}/${REPO_PREFIX}/order_service:${TAG} || true
+          kubectl -n "$STAGE_NS" set image deploy/frontend         frontend=${REGISTRY}/${REPO_PREFIX}/frontend:${TAG} || true
+
+          # alternate names used in some templates
+          kubectl -n "$STAGE_NS" set image deployment/customer-service-w10-aks customer-service-container=${REGISTRY}/${REPO_PREFIX}/customer_service:${TAG} || true
+          kubectl -n "$STAGE_NS" set image deployment/product-service-w10-aks  product-service-container=${REGISTRY}/${REPO_PREFIX}/product_service:${TAG}   || true
+          kubectl -n "$STAGE_NS" set image deployment/order-service-w10-aks    order-service-container=${REGISTRY}/${REPO_PREFIX}/order_service:${TAG}       || true
+          kubectl -n "$STAGE_NS" set image deployment/frontend-w10-aks         frontend-container=${REGISTRY}/${REPO_PREFIX}/frontend:${TAG}                 || true
+
+      - name: Wait for rollout (best effort)
+        run: |
+          for dep in \
+            customer-service product-service order-service frontend \
+            customer-service-w10-aks product-service-w10-aks order-service-w10-aks frontend-w10-aks
+          do
+            kubectl -n "$STAGE_NS" rollout status deployment/$dep --timeout=300s || true
+          done
+
+      - name: Smoke summary
+        run: |
+          kubectl -n "$STAGE_NS" get pods -o wide
+          kubectl -n "$STAGE_NS" get svc  -o wide
+          kubectl -n "$STAGE_NS" get ingress -o wide || true
