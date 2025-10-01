@@ -1,84 +1,144 @@
-name: CI (testing) - tests → ACR push
+name: CI - Stage 1 (Testing)
 
 on:
   push:
-    branches: [ testing ]
+    branches: [ "testing" ]
 
 env:
-  ACR_NAME: ${{ secrets.ACR_NAME }}                          # kiranacr722
-  ACR_LOGIN_SERVER: ${{ secrets.ACR_LOGIN_SERVER }}          # e.g. kiranacr722.azurecr.io
+  REGISTRY: ${{ secrets.ACR_LOGIN_SERVER }}   # e.g. kiranacr722.azurecr.io
+  IMAGE_TAG: ${{ github.sha }}
 
 jobs:
   test_backends:
+    name: Test Backends
     runs-on: ubuntu-latest
+
     services:
       postgres:
-        image: postgres:14
+        image: postgres:16
         env:
           POSTGRES_USER: postgres
           POSTGRES_PASSWORD: postgres
-          POSTGRES_DB: postgres
-        ports: [ "5432:5432" ]
+        ports:
+          - 5432:5432
         options: >-
           --health-cmd "pg_isready -U postgres"
-          --health-interval 10s
+          --health-interval 5s
           --health-timeout 5s
-          --health-retries 5
-    strategy:
-      matrix:
-        svc: [customer_service, product_service, order_service]
-        include:
-          - svc: customer_service
-            path: backend/customer_service
-          - svc: product_service
-            path: backend/product_service
-          - svc: order_service
-            path: backend/order_service
+          --health-retries 20
+
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
-        with: { python-version: "3.11" }
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
 
-      - name: Install dev deps
-        working-directory: ${{ matrix.path }}
+      - name: Wait for Postgres & create databases
+        env:
+          PGPASSWORD: postgres
+        run: |
+          sudo apt-get update -y && sudo apt-get install -y postgresql-client | cat
+          for i in {1..30}; do
+            pg_isready -h localhost -p 5432 -U postgres && break || sleep 2
+          done
+          createdb -h localhost -p 5432 -U postgres customers || true
+          createdb -h localhost -p 5432 -U postgres orders || true
+          createdb -h localhost -p 5432 -U postgres products || true
+
+      - name: Install shared test deps
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements-dev.txt
+          pip install pytest httpx
 
-      - name: Run pytest
-        working-directory: ${{ matrix.path }}
+      - name: Test customer_service
+        working-directory: backend/customer_service
         env:
           POSTGRES_HOST: localhost
           POSTGRES_PORT: "5432"
           POSTGRES_USER: postgres
           POSTGRES_PASSWORD: postgres
-          POSTGRES_DB: postgres
-        run: pytest -q
-
-  build_push_images:
-    needs: test_backends
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: azure/login@v2
-        with: { creds: ${{ secrets.AZURE_CREDENTIALS }} }
-
-      - name: Login to ACR
-        run: az acr login --name $ACR_NAME
-
-      - name: Build & push backend images (sha + testing-latest)
+          POSTGRES_DB: customers
         run: |
-          for svc in customer_service product_service order_service; do
-            docker build -t ${ACR_LOGIN_SERVER}/sit722/$svc:${{ github.sha }} ./backend/$svc
-            docker tag ${ACR_LOGIN_SERVER}/sit722/$svc:${{ github.sha }} ${ACR_LOGIN_SERVER}/sit722/$svc:testing-latest
-            docker push ${ACR_LOGIN_SERVER}/sit722/$svc:${{ github.sha }}
-            docker push ${ACR_LOGIN_SERVER}/sit722/$svc:testing-latest
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+          if [ -f requirements-dev.txt ]; then pip install -r requirements-dev.txt; fi
+          pytest -q
+
+      - name: Test product_service
+        working-directory: backend/product_service
+        env:
+          POSTGRES_HOST: localhost
+          POSTGRES_PORT: "5432"
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: products
+        run: |
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+          if [ -f requirements-dev.txt ]; then pip install -r requirements-dev.txt; fi
+          pytest -q
+
+      - name: Test order_service
+        working-directory: backend/order_service
+        env:
+          POSTGRES_HOST: localhost
+          POSTGRES_PORT: "5432"
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: orders
+          # prevent real outbound calls during tests
+          PRODUCT_SERVICE_URL: "http://127.0.0.1:9999"
+          CUSTOMER_SERVICE_URL: "http://127.0.0.1:9998"
+        run: |
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+          if [ -f requirements-dev.txt ]; then pip install -r requirements-dev.txt; fi
+          pytest -q
+
+  build_and_push_images:
+    name: Build & Push Images to ACR
+    runs-on: ubuntu-latest
+    needs: test_backends
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Azure login (OIDC)
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Docker login to ACR
+        uses: azure/docker-login@v2
+        with:
+          login-server: ${{ env.REGISTRY }}
+          username: ${{ fromJson(secrets.AZURE_CREDENTIALS).clientId }}
+          password: ${{ fromJson(secrets.AZURE_CREDENTIALS).clientSecret }}
+
+      - name: Build backend images
+        run: |
+          docker build -t $REGISTRY/customer_service:${IMAGE_TAG} ./backend/customer_service
+          docker build -t $REGISTRY/product_service:${IMAGE_TAG}  ./backend/product_service
+          docker build -t $REGISTRY/order_service:${IMAGE_TAG}    ./backend/order_service
+
+      - name: Build frontend image
+        run: |
+          docker build -t $REGISTRY/frontend:${IMAGE_TAG} ./frontend
+
+      - name: Push images (by SHA)
+        run: |
+          for img in customer_service product_service order_service frontend; do
+            docker push $REGISTRY/$img:${IMAGE_TAG}
           done
 
-      - name: Build & push frontend image (sha + testing-latest)
+      - name: Tag & push testing-latest
         run: |
-          docker build -t ${ACR_LOGIN_SERVER}/sit722/frontend:${{ github.sha }} ./frontend
-          docker tag ${ACR_LOGIN_SERVER}/sit722/frontend:${{ github.sha }} ${ACR_LOGIN_SERVER}/sit722/frontend:testing-latest
-          docker push ${ACR_LOGIN_SERVER}/sit722/frontend:${{ github.sha }}
-          docker push ${ACR_LOGIN_SERVER}/sit722/frontend:testing-latest
+          for img in customer_service product_service order_service frontend; do
+            docker tag $REGISTRY/$img:${IMAGE_TAG} $REGISTRY/$img:testing-latest
+            docker push $REGISTRY/$img:testing-latest
+          done
