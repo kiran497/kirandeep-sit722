@@ -20,12 +20,10 @@ permissions:
   id-token: write
   contents: read
 
-# prevent overlapping deploys
 concurrency:
   group: staging-${{ github.event.workflow_run.head_sha || github.run_id }}
   cancel-in-progress: true
 
-# global env
 env:
   REGISTRY: ${{ secrets.ACR_LOGIN_SERVER }}
 
@@ -35,18 +33,27 @@ jobs:
     if: github.event_name == 'workflow_dispatch' || (github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success')
     runs-on: ubuntu-latest
 
-    # ⬇️ Map repo VARIABLES to the env names used by the steps
     env:
-      AKS_RG:         ${{ vars.AKS_RESOURCE_GROUP }}   # e.g. rg-sit722-kiran
-      AKS_CLUSTER:    ${{ vars.AKS_CLUSTER_NAME }}     # e.g. kiranaks722
-      STAGE_NS:       ${{ vars.STAGING_NAMESPACE }}    # e.g. staging-sit722-kiran
+      AKS_RG:         ${{ vars.AKS_RESOURCE_GROUP }}     # e.g. rg-sit722-kiran
+      AKS_CLUSTER:    ${{ vars.AKS_CLUSTER_NAME }}       # e.g. kiranaks722
+      STAGE_NS:       ${{ vars.STAGING_NAMESPACE }}      # e.g. staging-sit722-kiran
       REPO_PREFIX:    ${{ vars.REPO_PREFIX || 'sit722' }}
       TAG:            ${{ inputs.image_tag || 'testing-latest' }}
 
     steps:
-      - uses: actions/checkout@v4
+      # ✅ checkout the exact commit that triggered CI (so k8s/ exists)
+      - name: Checkout triggering commit
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || github.sha }}
+          fetch-depth: 1
 
-      # quick guardrail so you immediately see if anything is empty
+      - name: Show repo tree
+        run: |
+          pwd
+          ls -la
+          test -d k8s && ls -la k8s || { echo "::error::k8s directory missing in this ref"; exit 1; }
+
       - name: Sanity check variables
         run: |
           echo "AKS_RG=${AKS_RG}"
@@ -69,12 +76,12 @@ jobs:
         with:
           resource-group:  ${{ env.AKS_RG }}
           cluster-name:    ${{ env.AKS_CLUSTER }}
-          subscription-id: ${{ fromJson(secrets.AZURE_CREDENTIALS).subscriptionId }}
+          # correct input name is 'subscription'
+          subscription:    ${{ fromJson(secrets.AZURE_CREDENTIALS).subscriptionId }}
 
       - name: Ensure namespace exists
         run: kubectl get ns "$STAGE_NS" >/dev/null 2>&1 || kubectl create ns "$STAGE_NS"
 
-      # create/update imagePullSecret (if your cluster doesn't use ACR MI)
       - name: Create/Update ACR imagePullSecret
         env:
           SP_APP_ID:   ${{ fromJson(secrets.AZURE_CREDENTIALS).clientId }}
@@ -89,17 +96,16 @@ jobs:
           kubectl -n "$STAGE_NS" patch serviceaccount default -p '{"imagePullSecrets":[{"name":"acr-cred"}]}' || true
 
       - name: Apply Kubernetes manifests
-        run: kubectl apply -n "$STAGE_NS" -f k8s/
+        working-directory: k8s
+        run: kubectl apply -n "$STAGE_NS" -f .
 
       - name: Set images to ${TAG}
         run: |
-          # plain names
           kubectl -n "$STAGE_NS" set image deploy/customer-service customer=${REGISTRY}/${REPO_PREFIX}/customer_service:${TAG} || true
           kubectl -n "$STAGE_NS" set image deploy/product-service  product=${REGISTRY}/${REPO_PREFIX}/product_service:${TAG} || true
           kubectl -n "$STAGE_NS" set image deploy/order-service    order=${REGISTRY}/${REPO_PREFIX}/order_service:${TAG} || true
           kubectl -n "$STAGE_NS" set image deploy/frontend         frontend=${REGISTRY}/${REPO_PREFIX}/frontend:${TAG} || true
 
-          # -w10-aks names (if your manifests use these)
           kubectl -n "$STAGE_NS" set image deployment/customer-service-w10-aks customer-service-container=${REGISTRY}/${REPO_PREFIX}/customer_service:${TAG} || true
           kubectl -n "$STAGE_NS" set image deployment/product-service-w10-aks  product-service-container=${REGISTRY}/${REPO_PREFIX}/product_service:${TAG}   || true
           kubectl -n "$STAGE_NS" set image deployment/order-service-w10-aks    order-service-container=${REGISTRY}/${REPO_PREFIX}/order_service:${TAG}       || true
