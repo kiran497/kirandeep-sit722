@@ -5,10 +5,11 @@ on:
     workflows: ["CI - Stage 1 (Testing)"]
     types: [completed]
     branches: [testing]
+  # optional: let you trigger a staging deploy by hand
   workflow_dispatch:
     inputs:
       image_tag:
-        description: "ACR tag to deploy (default: testing-latest)"
+        description: "Image tag to deploy (default: testing-latest)"
         required: false
         type: string
 
@@ -16,13 +17,18 @@ permissions:
   id-token: write
   contents: read
 
+# avoid overlapping staging deploys for the same commit
 concurrency:
   group: staging-${{ github.event.workflow_run.head_sha || github.sha }}
   cancel-in-progress: true
 
 env:
-  REGISTRY: ${{ secrets.ACR_LOGIN_SERVER }}
-  TAG: ${{ inputs.image_tag || 'testing-latest' }}
+  REGISTRY:        ${{ secrets.ACR_LOGIN_SERVER }}
+  REPO_PREFIX:     ${{ vars.REPO_PREFIX || 'sit722' }}
+  AKS_RG:          ${{ vars.AKS_RESOURCE_GROUP }}      # e.g. rg-sit722-kiran
+  AKS_CLUSTER:     ${{ vars.AKS_CLUSTER_NAME }}        # e.g. kiranaks722
+  STAGE_NS:        ${{ vars.STAGING_NAMESPACE }}       # e.g. staging-sit722-kiran
+  TAG:             ${{ inputs.image_tag || 'testing-latest' }}
 
 jobs:
   deploy:
@@ -32,99 +38,84 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # 1) Resolve and expose config (from repo vars with safe fallbacks)
-      - name: Resolve config
-        id: cfg
-        shell: bash
-        run: |
-          RG="${{ vars.AKS_RESOURCE_GROUP }}"
-          CLUSTER="${{ vars.AKS_CLUSTER_NAME }}"
-          NS="${{ vars.STAGING_NAMESPACE }}"
-          PREFIX="${{ vars.REPO_PREFIX }}"
-
-          : "${RG:=rg-sit722-kiran}"
-          : "${CLUSTER:=kiranaks722}"
-          : "${NS:=staging-sit722-kiran}"
-          : "${PREFIX:=sit722}"
-
-          echo "rg=$RG"         >> "$GITHUB_OUTPUT"
-          echo "cluster=$CLUSTER" >> "$GITHUB_OUTPUT"
-          echo "ns=$NS"         >> "$GITHUB_OUTPUT"
-          echo "prefix=$PREFIX" >> "$GITHUB_OUTPUT"
-
-          echo "Resolved -> RG=$RG CLUSTER=$CLUSTER NS=$NS PREFIX=$PREFIX TAG=${{ env.TAG }} REG=${{ env.REGISTRY }}"
-
-      # 2) Azure login
       - name: Azure login (OIDC)
         uses: azure/login@v2
         with:
           creds: ${{ secrets.AZURE_CREDENTIALS }}
 
-      # 3) Set AKS context (uses outputs from step 'cfg')
+      - name: Debug resolved values
+        run: |
+          echo "AKS_RG=${AKS_RG}"
+          echo "AKS_CLUSTER=${AKS_CLUSTER}"
+          echo "STAGE_NS=${STAGE_NS}"
+          echo "REGISTRY=${REGISTRY}"
+          echo "REPO_PREFIX=${REPO_PREFIX}"
+          echo "TAG=${TAG}"
+
+      - name: Sanity check inputs
+        run: |
+          set -e
+          for v in AKS_RG AKS_CLUSTER STAGE_NS REGISTRY REPO_PREFIX TAG; do
+            if [ -z "${!v}" ]; then
+              echo "::error title=Missing input::Environment variable '$v' is empty. Check repo Variables/Secrets."
+              exit 1
+            fi
+          done
+
       - name: Set AKS context
         uses: azure/aks-set-context@v4
         with:
-          resource-group:  ${{ steps.cfg.outputs.rg }}
-          cluster-name:    ${{ steps.cfg.outputs.cluster }}
+          resource-group:  ${{ env.AKS_RG }}
+          cluster-name:    ${{ env.AKS_CLUSTER }}
           subscription-id: ${{ fromJson(secrets.AZURE_CREDENTIALS).subscriptionId }}
 
-      # 4) Namespace
       - name: Ensure namespace exists
-        run: kubectl get ns "${{ steps.cfg.outputs.ns }}" >/dev/null 2>&1 || kubectl create ns "${{ steps.cfg.outputs.ns }}"
+        run: kubectl get ns "$STAGE_NS" >/dev/null 2>&1 || kubectl create ns "$STAGE_NS"
 
-      # 5) Image pull secret (if MI pull-through is not configured)
+      # If your cluster isn’t allowed to pull from ACR via managed identity, create an imagePullSecret
       - name: Create/Update ACR imagePullSecret
         env:
-          NS: ${{ steps.cfg.outputs.ns }}
-          REG: ${{ env.REGISTRY }}
           SP_APP_ID:   ${{ fromJson(secrets.AZURE_CREDENTIALS).clientId }}
-          SP_SECRET:   ${{ fromJson(secrets.AZURE_CREDENTIALS).clientSecret }}
+          SP_PASSWORD: ${{ fromJson(secrets.AZURE_CREDENTIALS).clientSecret }}
         run: |
-          kubectl -n "$NS" create secret docker-registry acr-cred \
-            --docker-server="$REG" \
+          kubectl -n "$STAGE_NS" create secret docker-registry acr-cred \
+            --docker-server="$REGISTRY" \
             --docker-username="$SP_APP_ID" \
-            --docker-password="$SP_SECRET" \
+            --docker-password="$SP_PASSWORD" \
             --docker-email="devnull@example.com" \
             --dry-run=client -o yaml | kubectl apply -f -
-          kubectl -n "$NS" patch serviceaccount default -p '{"imagePullSecrets":[{"name":"acr-cred"}]}' || true
+          kubectl -n "$STAGE_NS" patch serviceaccount default -p '{"imagePullSecrets":[{"name":"acr-cred"}]}' || true
 
-      # 6) Apply manifests
       - name: Apply Kubernetes manifests
-        run: kubectl apply -n "${{ steps.cfg.outputs.ns }}" -f k8s/
+        run: kubectl apply -n "$STAGE_NS" -f k8s/
 
-      # 7) Update images to the tag from CI
-      - name: Set images to tag
-        env:
-          NS:     ${{ steps.cfg.outputs.ns }}
-          REG:    ${{ env.REGISTRY }}
-          PREFIX: ${{ steps.cfg.outputs.prefix }}
-          TAG:    ${{ env.TAG }}
+      - name: Set images to ${{ env.TAG }}
         run: |
-          # generic names
-          kubectl -n "$NS" set image deploy/customer-service customer=$REG/$PREFIX/customer_service:$TAG || true
-          kubectl -n "$NS" set image deploy/product-service  product=$REG/$PREFIX/product_service:$TAG  || true
-          kubectl -n "$NS" set image deploy/order-service    order=$REG/$PREFIX/order_service:$TAG      || true
-          kubectl -n "$NS" set image deploy/frontend         frontend=$REG/$PREFIX/frontend:$TAG        || true
+          set -x
+          # deployment names without suffix
+          kubectl -n "$STAGE_NS" set image deploy/customer-service customer=${REGISTRY}/${REPO_PREFIX}/customer_service:${TAG} || true
+          kubectl -n "$STAGE_NS" set image deploy/product-service  product=${REGISTRY}/${REPO_PREFIX}/product_service:${TAG} || true
+          kubectl -n "$STAGE_NS" set image deploy/order-service    order=${REGISTRY}/${REPO_PREFIX}/order_service:${TAG} || true
+          kubectl -n "$STAGE_NS" set image deploy/frontend         frontend=${REGISTRY}/${REPO_PREFIX}/frontend:${TAG} || true
 
-          # -w10-aks names
-          kubectl -n "$NS" set image deploy/customer-service-w10-aks customer-service-container=$REG/$PREFIX/customer_service:$TAG || true
-          kubectl -n "$NS" set image deploy/product-service-w10-aks  product-service-container=$REG/$PREFIX/product_service:$TAG  || true
-          kubectl -n "$NS" set image deploy/order-service-w10-aks    order-service-container=$REG/$PREFIX/order_service:$TAG      || true
-          kubectl -n "$NS" set image deploy/frontend-w10-aks         frontend-container=$REG/$PREFIX/frontend:$TAG                || true
+          # deployment names with -w10-aks suffix
+          kubectl -n "$STAGE_NS" set image deployment/customer-service-w10-aks customer-service-container=${REGISTRY}/${REPO_PREFIX}/customer_service:${TAG} || true
+          kubectl -n "$STAGE_NS" set image deployment/product-service-w10-aks  product-service-container=${REGISTRY}/${REPO_PREFIX}/product_service:${TAG} || true
+          kubectl -n "$STAGE_NS" set image deployment/order-service-w10-aks    order-service-container=${REGISTRY}/${REPO_PREFIX}/order_service:${TAG} || true
+          kubectl -n "$STAGE_NS" set image deployment/frontend-w10-aks         frontend-container=${REGISTRY}/${REPO_PREFIX}/frontend:${TAG} || true
 
-      # 8) Wait for rollout (tolerate non-existent names)
       - name: Wait for rollout
-        env:
-          NS: ${{ steps.cfg.outputs.ns }}
         run: |
-          for d in customer-service product-service order-service frontend \
-                   customer-service-w10-aks product-service-w10-aks order-service-w10-aks frontend-w10-aks
+          # Try both naming patterns; ignore the ones that don’t exist
+          for dep in \
+            customer-service product-service order-service frontend \
+            customer-service-w10-aks product-service-w10-aks order-service-w10-aks frontend-w10-aks
           do
-            kubectl -n "$NS" rollout status deployment/$d --timeout=300s || true
+            kubectl -n "$STAGE_NS" rollout status deployment/$dep --timeout=300s || true
           done
 
       - name: Smoke check
         run: |
-          kubectl -n "${{ steps.cfg.outputs.ns }}" get pods -o wide
-          kubectl -n "${{ steps.cfg.outputs.ns }}" get svc  -o wide
-          kubectl -n "${{ steps.cfg.outputs.ns }}" get ingress -o wide || true
+          kubectl -n "$STAGE_NS" get pods -o wide
+          kubectl -n "$STAGE_NS" get svc -o wide
+          kubectl -n "$STAGE_NS" get ingress -o wide || true
