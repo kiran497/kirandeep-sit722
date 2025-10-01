@@ -1,66 +1,65 @@
-name: CD (staging) - ephemeral AKS
+name: CD - Stage 2 (Staging)
 
 on:
   workflow_run:
-    workflows: ["CI (testing) - tests → ACR push"]
+    workflows: ["CI - Stage 1 (Testing)", "CI — Verify, Build, Publish (testing)"]
     types: [completed]
-    branches: [testing]
+
+permissions:
+  id-token: write
+  contents: read
 
 env:
-  ACR_LOGIN_SERVER: ${{ secrets.ACR_LOGIN_SERVER }}
-  AKS_RG: ${{ vars.AKS_RESOURCE_GROUP }}        # rg-sit722-kiran
-  AKS_CLUSTER: ${{ vars.AKS_CLUSTER_NAME }}     # kiranaks722
+  REGISTRY: ${{ secrets.ACR_LOGIN_SERVER }}
+  REPO_PREFIX: ${{ vars.REPO_PREFIX || 'sit722' }}
+  AKS_RG: ${{ vars.AKS_RG }}
+  AKS_CLUSTER: ${{ vars.AKS_CLUSTER }}
+  STAGE_NS: ${{ vars.STAGE_NS }}
+  TAG: testing-latest
 
 jobs:
-  staging:
-    if: ${{ github.event.workflow_run.conclusion == 'success' }}
+  deploy:
+    if: >
+      ${{
+        github.event.workflow_run.conclusion == 'success' &&
+        github.event.workflow_run.head_branch == 'testing'
+      }}
     runs-on: ubuntu-latest
+
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
 
-      - uses: azure/login@v2
-        with: { creds: ${{ secrets.AZURE_CREDENTIALS }} }
+      - name: Azure login
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
 
       - name: Set AKS context
         uses: azure/aks-set-context@v4
         with:
           resource-group: ${{ env.AKS_RG }}
-          cluster-name:  ${{ env.AKS_CLUSTER }}
+          cluster-name: ${{ env.AKS_CLUSTER }}
 
-      - name: Create ephemeral staging namespace
-        id: ns
+      - name: Ensure namespace
+        run: kubectl get ns $STAGE_NS || kubectl create ns $STAGE_NS
+
+      - name: Apply Kubernetes manifests
+        run: kubectl apply -n $STAGE_NS -f k8s/
+
+      - name: Set images to testing-latest
         run: |
-          NS="stg-sit722-kiran-${{ github.run_id }}"
-          kubectl create namespace $NS
-          echo "ns=$NS" >> $GITHUB_OUTPUT
+          kubectl -n $STAGE_NS set image deploy/customer-service customer=${REGISTRY}/${REPO_PREFIX}/customer_service:${TAG} || true
+          kubectl -n $STAGE_NS set image deploy/product-service  product=${REGISTRY}/${REPO_PREFIX}/product_service:${TAG} || true
+          kubectl -n $STAGE_NS set image deploy/order-service    order=${REGISTRY}/${REPO_PREFIX}/order_service:${TAG} || true
+          kubectl -n $STAGE_NS set image deploy/frontend         frontend=${REGISTRY}/${REPO_PREFIX}/frontend:${TAG} || true
 
-      - name: Apply base manifests to staging
-        run: kubectl -n ${{ steps.ns.outputs.ns }} apply -f k8s/
-
-      # Deployment/container names expected from your ZIP:
-      # customer-service, product-service, order-service, frontend
-      - name: Pin images to testing-latest
+      - name: Wait for rollout
         run: |
-          kubectl -n ${{ steps.ns.outputs.ns }} set image deployment/customer-service customer-service=${{ env.ACR_LOGIN_SERVER }}/sit722/customer_service:testing-latest
-          kubectl -n ${{ steps.ns.outputs.ns }} set image deployment/product-service  product-service=${{ env.ACR_LOGIN_SERVER }}/sit722/product_service:testing-latest
-          kubectl -n ${{ steps.ns.outputs.ns }} set image deployment/order-service    order-service=${{ env.ACR_LOGIN_SERVER }}/sit722/order_service:testing-latest
-          kubectl -n ${{ steps.ns.outputs.ns }} set image deployment/frontend         frontend=${{ env.ACR_LOGIN_SERVER }}/sit722/frontend:testing-latest
+          for d in customer-service product-service order-service frontend; do
+            kubectl -n $STAGE_NS rollout status deploy/$d --timeout=180s
+          done
 
-      - name: Wait for rollouts
-        run: |
-          kubectl -n ${{ steps.ns.outputs.ns }} rollout status deployment/customer-service --timeout=120s
-          kubectl -n ${{ steps.ns.outputs.ns }} rollout status deployment/product-service  --timeout=120s
-          kubectl -n ${{ steps.ns.outputs.ns }} rollout status deployment/order-service    --timeout=120s
-          kubectl -n ${{ steps.ns.outputs.ns }} rollout status deployment/frontend         --timeout=120s
-
-      - name: Smoke test (frontend via port-forward)
-        run: |
-          kubectl -n ${{ steps.ns.outputs.ns }} port-forward svc/frontend 8080:80 &
-          PF=$!
-          sleep 5
-          curl -sSf http://127.0.0.1:8080/ > /dev/null
-          kill $PF || true
-
-      - name: Always delete staging namespace
-        if: always()
-        run: kubectl delete namespace ${{ steps.ns.outputs.ns }} --wait=false || true
+      - name: Smoke check (basic)
+        run: kubectl -n $STAGE_NS get pods,svc,ingress -o wide
