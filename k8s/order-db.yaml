@@ -1,3 +1,11 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: order-db
+spec:
+  selector: { app: order-db }
+  ports: [{ port: 5432, targetPort: 5432 }]
+---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -13,25 +21,9 @@ spec:
           image: postgres:16
           ports: [{ containerPort: 5432 }]
           env:
-            - name: POSTGRES_DB
-              valueFrom: { configMapKeyRef: { name: app-config, key: ORDER_DB } }
             - name: POSTGRES_USER
-              valueFrom: { secretKeyRef: { name: pg-credentials, key: POSTGRES_USER } }
+              valueFrom: { secretKeyRef: { name: ecomm-secrets, key: POSTGRES_USER } }
             - name: POSTGRES_PASSWORD
-              valueFrom: { secretKeyRef: { name: pg-credentials, key: POSTGRES_PASSWORD } }
-          volumeMounts:
-            - name: data
-              mountPath: /var/lib/postgresql/data
-      volumes:
-        - name: data
-          emptyDir: {}
----
-apiVersion: v1
-kind: Service
-metadata:
-  name: order-db
-spec:
-  selector: { app: order-db }
-  ports:
-    - port: 5432
-      targetPort: 5432
+              valueFrom: { secretKeyRef: { name: ecomm-secrets, key: POSTGRES_PASSWORD } }
+            - name: POSTGRES_DB
+              value: orders

@@ -2,7 +2,7 @@ name: CD - Stage 2 (Staging)
 
 on:
   workflow_run:
-    # MUST match your CI workflow name exactly
+    # MUST match the name: at the top of your CI workflow exactly
     workflows: ["CI - Stage 1 (Testing)"]
     types: [completed]
   workflow_dispatch: {}
@@ -16,12 +16,12 @@ permissions:
   contents: read
 
 env:
-  # AKS / ACR / namespace
-  AKS_RG: ${{ vars.AKS_RESOURCE_GROUP }}        # rg-sit722-kiran (set as repo variable)
-  AKS_CLUSTER: ${{ vars.AKS_CLUSTER_NAME }}     # kiranaks722      (set as repo variable)
-  STAGE_NS: staging-sit722-kiran
+  # AKS / ACR / namespace from your repo variables & secrets
+  AKS_RG: ${{ vars.AKS_RESOURCE_GROUP }}        # rg-sit722-kiran
+  AKS_CLUSTER: ${{ vars.AKS_CLUSTER_NAME }}     # kiranaks722
+  STAGE_NS: ${{ vars.STAGING_NAMESPACE }}       # staging-sit722-kiran
   REGISTRY: ${{ secrets.ACR_LOGIN_SERVER }}     # kiranacr722.azurecr.io
-  REPO_PREFIX: sit722
+  REPO_PREFIX: ${{ vars.REPO_PREFIX }}          # sit722
   TAG: testing-latest
 
 jobs:
@@ -95,7 +95,7 @@ jobs:
           kubectl -n "${STAGE_NS}" apply -f k8s/order-service.yaml
           kubectl -n "${STAGE_NS}" apply -f k8s/frontend.yaml
 
-      # ---------- Retry-based smoke test (unique curl pod) ----------
+      # ---------- Retry-based smoke test (no rollout) ----------
       - name: Smoke test with unique curl pod
         run: |
           set -euo pipefail

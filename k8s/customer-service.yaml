@@ -1,35 +1,42 @@
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: customer-service
-spec:
-  replicas: 1
-  selector: { matchLabels: { app: customer-service } }
-  template:
-    metadata: { labels: { app: customer-service } }
-    spec:
-      containers:
-        - name: customer
-          image: nginx:alpine   # will be replaced by CD
-          ports: [{ containerPort: 8000 }]
-          env:
-            - name: POSTGRES_HOST
-              value: customer-db
-            - name: POSTGRES_PORT
-              valueFrom: { configMapKeyRef: { name: app-config, key: POSTGRES_PORT } }
-            - name: POSTGRES_DB
-              valueFrom: { configMapKeyRef: { name: app-config, key: CUSTOMER_DB } }
-            - name: POSTGRES_USER
-              valueFrom: { secretKeyRef: { name: pg-credentials, key: POSTGRES_USER } }
-            - name: POSTGRES_PASSWORD
-              valueFrom: { secretKeyRef: { name: pg-credentials, key: POSTGRES_PASSWORD } }
----
 apiVersion: v1
 kind: Service
 metadata:
   name: customer-service
 spec:
   selector: { app: customer-service }
-  ports:
-    - port: 8000
-      targetPort: 8000
+  ports: [{ port: 8000, targetPort: 8000 }]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: customer-service
+spec:
+  strategy: { type: Recreate }
+  replicas: 1
+  selector: { matchLabels: { app: customer-service } }
+  template:
+    metadata: { labels: { app: customer-service } }
+    spec:
+      imagePullSecrets: [{ name: acr-cred }]
+      terminationGracePeriodSeconds: 10
+      initContainers:
+        - name: wait-for-db
+          image: busybox:1.36
+          command: ['sh','-c','until nc -z -w 2 customer-db 5432; do echo "waiting for customer-db"; sleep 2; done']
+      containers:
+        - name: customer
+          image: kiranacr722.azurecr.io/sit722/customer_service:testing-latest
+          ports: [{ containerPort: 8000 }]
+          readinessProbe:
+            tcpSocket: { port: 8000 }
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            failureThreshold: 12
+          env:
+            - { name: POSTGRES_HOST, value: customer-db }
+            - { name: POSTGRES_PORT, value: "5432" }
+            - { name: POSTGRES_DB,   value: customers }
+            - name: POSTGRES_USER
+              valueFrom: { secretKeyRef: { name: ecomm-secrets, key: POSTGRES_USER } }
+            - name: POSTGRES_PASSWORD
+              valueFrom: { secretKeyRef: { name: ecomm-secrets, key: POSTGRES_PASSWORD } }
