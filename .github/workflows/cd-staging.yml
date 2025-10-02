@@ -2,14 +2,13 @@ name: CD - Stage 2 (Staging)
 
 on:
   workflow_run:
-    # Put EVERY possible CI name you use here (must match EXACTLY as shown in Actions)
     workflows:
       - "CI - Stage 1 (Testing + Build + Push)"
       - "CI - Stage 1 (Testing)"
-      - "CI — Verify, Build, Publish (testing)"  
-    branches: [testing]   
+      - "CI — Verify, Build, Publish (testing)"   # EN DASH
+    branches: [testing]
     types: [completed]
-  workflow_dispatch: {}     
+  workflow_dispatch: {}
 
 concurrency:
   group: staging-${{ github.event.workflow_run.head_sha || github.sha }}
@@ -20,17 +19,15 @@ permissions:
   contents: read
 
 env:
-  # AKS / ACR config
-  AKS_RG: ${{ vars.AKS_RESOURCE_GROUP }}       # e.g. rg-sit722-kiran
-  AKS_CLUSTER: ${{ vars.AKS_CLUSTER_NAME }}    # e.g. kiranaks722
+  AKS_RG: ${{ vars.AKS_RESOURCE_GROUP }}        # rg-sit722-kiran
+  AKS_CLUSTER: ${{ vars.AKS_CLUSTER_NAME }}     # kiranaks722
   STAGE_NS: staging-sit722-kiran
-  REGISTRY: ${{ secrets.ACR_LOGIN_SERVER }}    # e.g. kiranacr722.azurecr.io
+  REGISTRY: ${{ secrets.ACR_LOGIN_SERVER }}     # kiranacr722.azurecr.io
   REPO_PREFIX: sit722
   TAG: testing-latest
 
 jobs:
   deploy:
-    # Run only when CI on 'testing' succeeded (or manual run)
     if: >
       (github.event_name == 'workflow_run' &&
        github.event.workflow_run.conclusion == 'success' &&
@@ -80,13 +77,14 @@ jobs:
             --from-literal=POSTGRES_USER=postgres \
             --from-literal=POSTGRES_PASSWORD=postgres
 
-      # ---------- Apply DBs then apps (no rollout status) ----------
+      # DBs first
       - name: Apply DB manifests
         run: |
           kubectl -n "${STAGE_NS}" apply -f k8s/customer-db.yaml
           kubectl -n "${STAGE_NS}" apply -f k8s/product-db.yaml
           kubectl -n "${STAGE_NS}" apply -f k8s/order-db.yaml
-          echo "Giving Postgres a head start..."
+          kubectl -n "${STAGE_NS}" apply -f k8s/rabbitmq.yaml
+          echo "Giving DBs a head start..."
           sleep 15
 
       - name: Apply app manifests
@@ -96,29 +94,34 @@ jobs:
           kubectl -n "${STAGE_NS}" apply -f k8s/order-service.yaml
           kubectl -n "${STAGE_NS}" apply -f k8s/frontend.yaml
 
-      # ---------- Retry-based readiness instead of rollout ----------
+      # Retry-based smoke test (unique curl pod)
       - name: Retry smoke test (no rollout)
         run: |
-          set -e
-          kubectl -n "${STAGE_NS}" run curl --image=curlimages/curl:8.10.1 --restart=Never --command -- sleep 3600
-          kubectl -n "${STAGE_NS}" wait --for=condition=Ready pod/curl --timeout=60s
+          set -euo pipefail
+          CURL_POD="curl-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          kubectl -n "${STAGE_NS}" delete pod -l app=curl-test --ignore-not-found || true
+          kubectl -n "${STAGE_NS}" run "${CURL_POD}" --image=curlimages/curl:8.10.1 \
+            --labels app=curl-test --restart=Never --command -- sleep 3600
+          kubectl -n "${STAGE_NS}" wait --for=condition=Ready "pod/${CURL_POD}" --timeout=120s
+
           for svc in customer-service product-service order-service; do
             echo "Waiting for $svc to respond on :8000 ..."
-            i=0
-            until kubectl -n "${STAGE_NS}" exec curl -- sh -c "curl -sf http://$svc:8000/ >/dev/null"; do
-              i=$((i+1))
-              if [ $i -ge 90 ]; then
+            for i in $(seq 1 90); do
+              if kubectl -n "${STAGE_NS}" exec "${CURL_POD}" -- sh -c "curl -sf http://$svc:8000/ >/dev/null"; then
+                echo "$svc OK"; break
+              fi
+              sleep 5
+              if [ $i -eq 90 ]; then
                 echo "ERROR: $svc did not respond after $i attempts."
                 kubectl -n "${STAGE_NS}" get pods -o wide
                 kubectl -n "${STAGE_NS}" describe deploy/$svc | sed -n '1,200p' || true
                 kubectl -n "${STAGE_NS}" logs deploy/$svc --tail=200 || true
                 exit 1
               fi
-              sleep 5
             done
-            echo "$svc OK"
           done
-          kubectl -n "${STAGE_NS}" delete pod curl --ignore-not-found
+
+          kubectl -n "${STAGE_NS}" delete pod "${CURL_POD}" --ignore-not-found || true
 
       - name: Snapshot (always)
         if: always()
