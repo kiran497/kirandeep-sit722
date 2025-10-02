@@ -4,5 +4,5 @@ metadata:
   name: app-config
 data:
   CUSTOMER_URL: "http://customer-service:8000"
-  PRODUCT_URL: "http://product-service:8000"
-  ORDER_URL: "http://order-service:8000"
+  PRODUCT_URL:  "http://product-service:8000"
+  ORDER_URL:    "http://order-service:8000"

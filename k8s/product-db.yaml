@@ -3,11 +3,8 @@ kind: Service
 metadata:
   name: product-db
 spec:
-  selector:
-    app: product-db
-  ports:
-    - port: 5432
-      targetPort: 5432
+  selector: { app: product-db }
+  ports: [{ port: 5432, targetPort: 5432 }]
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -15,29 +12,18 @@ metadata:
   name: product-db
 spec:
   replicas: 1
-  selector:
-    matchLabels:
-      app: product-db
+  selector: { matchLabels: { app: product-db } }
   template:
-    metadata:
-      labels:
-        app: product-db
+    metadata: { labels: { app: product-db } }
     spec:
       containers:
         - name: postgres
           image: postgres:16
-          ports:
-            - containerPort: 5432
+          ports: [{ containerPort: 5432 }]
           env:
             - name: POSTGRES_USER
-              valueFrom:
-                secretKeyRef:
-                  name: ecomm-secrets
-                  key: POSTGRES_USER
+              valueFrom: { secretKeyRef: { name: ecomm-secrets, key: POSTGRES_USER } }
             - name: POSTGRES_PASSWORD
-              valueFrom:
-                secretKeyRef:
-                  name: ecomm-secrets
-                  key: POSTGRES_PASSWORD
+              valueFrom: { secretKeyRef: { name: ecomm-secrets, key: POSTGRES_PASSWORD } }
             - name: POSTGRES_DB
               value: products

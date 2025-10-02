@@ -1,13 +1,10 @@
----
 apiVersion: v1
 kind: Service
 metadata:
   name: product-service
 spec:
   selector: { app: product-service }
-  ports:
-    - port: 8000
-      targetPort: 8000
+  ports: [{ port: 8000, targetPort: 8000 }]
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -22,14 +19,13 @@ spec:
     spec:
       imagePullSecrets: [{ name: acr-cred }]
       terminationGracePeriodSeconds: 10
-      # wait for DB and RabbitMQ to be reachable
       initContainers:
         - name: wait-for-db
           image: busybox:1.36
-          command: ['sh','-c','until nc -z product-db 5432; do echo "waiting for product-db"; sleep 2; done']
+          command: ['sh','-c','until nc -z -w 2 product-db 5432; do echo "waiting for product-db"; sleep 2; done']
         - name: wait-for-rabbitmq
           image: busybox:1.36
-          command: ['sh','-c','until nc -z rabbitmq 5672; do echo "waiting for rabbitmq"; sleep 2; done']
+          command: ['sh','-c','until nc -z -w 2 rabbitmq 5672; do echo "waiting for rabbitmq"; sleep 2; done']
       containers:
         - name: product
           image: kiranacr722.azurecr.io/sit722/product_service:testing-latest
@@ -40,7 +36,6 @@ spec:
             periodSeconds: 5
             failureThreshold: 12
           env:
-            # Postgres
             - { name: POSTGRES_HOST, value: product-db }
             - { name: POSTGRES_PORT, value: "5432" }
             - { name: POSTGRES_DB,   value: products }
@@ -48,6 +43,6 @@ spec:
               valueFrom: { secretKeyRef: { name: ecomm-secrets, key: POSTGRES_USER } }
             - name: POSTGRES_PASSWORD
               valueFrom: { secretKeyRef: { name: ecomm-secrets, key: POSTGRES_PASSWORD } }
-            # RabbitMQ (FIXED)
+            # RabbitMQ (must be host/port, not URL)
             - { name: RABBITMQ_HOST, value: rabbitmq }
             - { name: RABBITMQ_PORT, value: "5672" }

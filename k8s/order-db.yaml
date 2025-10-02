@@ -3,11 +3,8 @@ kind: Service
 metadata:
   name: order-db
 spec:
-  selector:
-    app: order-db
-  ports:
-    - port: 5432
-      targetPort: 5432
+  selector: { app: order-db }
+  ports: [{ port: 5432, targetPort: 5432 }]
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -15,29 +12,18 @@ metadata:
   name: order-db
 spec:
   replicas: 1
-  selector:
-    matchLabels:
-      app: order-db
+  selector: { matchLabels: { app: order-db } }
   template:
-    metadata:
-      labels:
-        app: order-db
+    metadata: { labels: { app: order-db } }
     spec:
       containers:
         - name: postgres
           image: postgres:16
-          ports:
-            - containerPort: 5432
+          ports: [{ containerPort: 5432 }]
           env:
             - name: POSTGRES_USER
-              valueFrom:
-                secretKeyRef:
-                  name: ecomm-secrets
-                  key: POSTGRES_USER
+              valueFrom: { secretKeyRef: { name: ecomm-secrets, key: POSTGRES_USER } }
             - name: POSTGRES_PASSWORD
-              valueFrom:
-                secretKeyRef:
-                  name: ecomm-secrets
-                  key: POSTGRES_PASSWORD
+              valueFrom: { secretKeyRef: { name: ecomm-secrets, key: POSTGRES_PASSWORD } }
             - name: POSTGRES_DB
               value: orders

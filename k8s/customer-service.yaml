@@ -1,13 +1,10 @@
----
 apiVersion: v1
 kind: Service
 metadata:
   name: customer-service
 spec:
   selector: { app: customer-service }
-  ports:
-    - port: 8000
-      targetPort: 8000
+  ports: [{ port: 8000, targetPort: 8000 }]
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -25,7 +22,7 @@ spec:
       initContainers:
         - name: wait-for-db
           image: busybox:1.36
-          command: ['sh','-c','until nc -z customer-db 5432; do echo "waiting for customer-db"; sleep 2; done']
+          command: ['sh','-c','until nc -z -w 2 customer-db 5432; do echo "waiting for customer-db"; sleep 2; done']
       containers:
         - name: customer
           image: kiranacr722.azurecr.io/sit722/customer_service:testing-latest
