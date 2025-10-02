@@ -2,11 +2,8 @@ name: CD - Stage 2 (Staging)
 
 on:
   workflow_run:
-    workflows:
-      - "CI - Stage 1 (Testing + Build + Push)"
-      - "CI - Stage 1 (Testing)"
-      - "CI — Verify, Build, Publish (testing)"   # EN DASH
-    branches: [testing]
+    # MUST match the name: at the top of your CI workflow exactly
+    workflows: ["CI - Stage 1 (Testing)"]
     types: [completed]
   workflow_dispatch: {}
 
@@ -19,20 +16,22 @@ permissions:
   contents: read
 
 env:
+  # AKS / ACR / namespace from your repo variables & secrets
   AKS_RG: ${{ vars.AKS_RESOURCE_GROUP }}        # rg-sit722-kiran
   AKS_CLUSTER: ${{ vars.AKS_CLUSTER_NAME }}     # kiranaks722
-  STAGE_NS: staging-sit722-kiran
+  STAGE_NS: ${{ vars.STAGING_NAMESPACE }}       # staging-sit722-kiran
   REGISTRY: ${{ secrets.ACR_LOGIN_SERVER }}     # kiranacr722.azurecr.io
-  REPO_PREFIX: sit722
+  REPO_PREFIX: ${{ vars.REPO_PREFIX }}          # sit722
   TAG: testing-latest
 
 jobs:
   deploy:
+    # Allow manual runs OR successful CI runs from the 'testing' branch
     if: >
+      github.event_name == 'workflow_dispatch' ||
       (github.event_name == 'workflow_run' &&
        github.event.workflow_run.conclusion == 'success' &&
        github.event.workflow_run.head_branch == 'testing')
-      || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
 
     steps:
@@ -77,33 +76,43 @@ jobs:
             --from-literal=POSTGRES_USER=postgres \
             --from-literal=POSTGRES_PASSWORD=postgres
 
-      # DBs first
-      - name: Apply DB manifests
+      # ---------- DBs + RabbitMQ first ----------
+      - name: Apply DB & MQ manifests
         run: |
+          set -e
           kubectl -n "${STAGE_NS}" apply -f k8s/customer-db.yaml
           kubectl -n "${STAGE_NS}" apply -f k8s/product-db.yaml
           kubectl -n "${STAGE_NS}" apply -f k8s/order-db.yaml
           kubectl -n "${STAGE_NS}" apply -f k8s/rabbitmq.yaml
-          echo "Giving DBs a head start..."
+          echo "Giving databases & MQ a head start..."
           sleep 15
 
       - name: Apply app manifests
         run: |
+          set -e
           kubectl -n "${STAGE_NS}" apply -f k8s/customer-service.yaml
           kubectl -n "${STAGE_NS}" apply -f k8s/product-service.yaml
           kubectl -n "${STAGE_NS}" apply -f k8s/order-service.yaml
           kubectl -n "${STAGE_NS}" apply -f k8s/frontend.yaml
 
-      # Retry-based smoke test (unique curl pod)
-      - name: Retry smoke test (no rollout)
+      # ---------- Retry-based smoke test (no rollout) ----------
+      - name: Smoke test with unique curl pod
         run: |
           set -euo pipefail
           CURL_POD="curl-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+
+          # Clean any leftovers
           kubectl -n "${STAGE_NS}" delete pod -l app=curl-test --ignore-not-found || true
-          kubectl -n "${STAGE_NS}" run "${CURL_POD}" --image=curlimages/curl:8.10.1 \
-            --labels app=curl-test --restart=Never --command -- sleep 3600
+
+          # Create a unique curl pod
+          kubectl -n "${STAGE_NS}" run "${CURL_POD}" \
+            --image=curlimages/curl:8.10.1 \
+            --labels app=curl-test \
+            --restart=Never --command -- sleep 3600
+
           kubectl -n "${STAGE_NS}" wait --for=condition=Ready "pod/${CURL_POD}" --timeout=120s
 
+          # Probe each internal service root
           for svc in customer-service product-service order-service; do
             echo "Waiting for $svc to respond on :8000 ..."
             for i in $(seq 1 90); do
